@@ -1,0 +1,42 @@
+# PPT 实验 ③：buffered + 固定 buffer_size，关闭动态控制（与 ① 对比「动态调节」）
+# 差异：dynamic_control.enabled: false
+seed: 42
+num_clients: 5
+updates_per_client: 80
+dataset: MNIST
+data_dir: /home/kamila/SCAFL/data/mnist_smoke
+non_iid: false
+num_shards: 4
+model: mlp
+batch_size: 64
+local_epochs: 1
+local_lr: 0.01
+momentum: 0.9
+weight_decay: 0.0001
+grad_clip: 5.0
+server_lr: 0.3
+async_mode: buffered
+buffer_size: 2
+staleness_weight: exp
+staleness_lambda: 0.2
+staleness_cutoff: 8
+dynamic_control:
+  enabled: false
+  tau_min: 1
+  tau_base: 8
+  tau_max_limit: 32
+  buffer_min: 1
+  buffer_base: 2
+  buffer_max: 32
+  delay_ref: 1.0
+  heter_ref: 1.0
+  staleness_ref: 1.0
+  tau_coeff_delay: 0.5
+  tau_coeff_heter: 0.5
+  tau_coeff_staleness: 0.5
+  buffer_coeff_delay: 0.5
+  buffer_coeff_heter: 0.5
+  buffer_coeff_staleness: 0.5
+eval_every: 1
+log_root: /home/kamila/SCAFL/logs/ppt_prepared/03_buffered_no_dynamic
+device: cuda

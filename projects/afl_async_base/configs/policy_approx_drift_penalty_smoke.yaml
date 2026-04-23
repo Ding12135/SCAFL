@@ -1,0 +1,35 @@
+# 近似 drift-plus-penalty：按 d_k 排序后枚举前缀子集，选 objective = V*time_term+queue_term 最小者。
+# 验证：evaluated_prefix_count = min(max_select_size, candidate_count)；
+# selected_prefix_size 可在 1..m_max 间变化（非恒等于 select_size 式固定 k）。
+# 与 sorted_subset(select_size=k) 对照：若某轮 selected_prefix_size != k，说明目标优化在起作用。
+seed: 42
+num_clients: 4
+updates_per_client: 24
+dataset: MNIST
+data_dir: /home/kamila/SCAFL/data/mnist_smoke
+non_iid: false
+num_shards: 4
+model: mlp
+batch_size: 64
+local_epochs: 1
+local_lr: 0.01
+momentum: 0.9
+weight_decay: 0.0001
+grad_clip: 5.0
+server_lr: 0.3
+async_mode: buffered
+buffer_size: 99
+staleness_weight: exp
+staleness_lambda: 0.2
+staleness_cutoff: 12
+dynamic_control:
+  enabled: false
+eval_every: 1
+log_root: /home/kamila/SCAFL/logs/policy_approx_drift_penalty_smoke
+device: cpu
+
+policy:
+  type: approx_drift_penalty
+  min_select_size: 4
+  max_select_size: 6
+  V: 1.0

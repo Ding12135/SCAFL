@@ -1,0 +1,43 @@
+# PPT 实验 ①：buffered + staleness(exp) + 动态控制（建议作为基线）
+# 与 ②③④ 仅差异项见各文件顶部注释
+# 调参说明：避免 buffer_target=1 导致条条 flush；减弱 score 对 tau/buffer 的下拉；略放宽 cutoff。
+seed: 42
+num_clients: 5
+updates_per_client: 80
+dataset: MNIST
+data_dir: /home/kamila/SCAFL/data/mnist_smoke
+non_iid: false
+num_shards: 4
+model: mlp
+batch_size: 64
+local_epochs: 1
+local_lr: 0.01
+momentum: 0.9
+weight_decay: 0.0001
+grad_clip: 5.0
+server_lr: 0.25
+async_mode: buffered
+buffer_size: 2
+staleness_weight: exp
+staleness_lambda: 0.2
+staleness_cutoff: 12
+dynamic_control:
+  enabled: true
+  tau_min: 1
+  tau_base: 12
+  tau_max_limit: 32
+  buffer_min: 2
+  buffer_base: 4
+  buffer_max: 32
+  delay_ref: 10.0
+  heter_ref: 5.0
+  staleness_ref: 4.0
+  tau_coeff_delay: 0.15
+  tau_coeff_heter: 0.15
+  tau_coeff_staleness: 0.15
+  buffer_coeff_delay: 0.15
+  buffer_coeff_heter: 0.15
+  buffer_coeff_staleness: 0.15
+eval_every: 1
+log_root: /home/kamila/SCAFL/logs/ppt_prepared/01_buffered_dynamic
+device: cuda

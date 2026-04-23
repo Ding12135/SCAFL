@@ -1,0 +1,350 @@
+afl_async_base 逐文件阅读地图（.py）
+
+用途
+- 这份文档按“文件在做什么 + 怎么被调用 + 它又调用谁 + 阅读重点”组织。
+- 目标是让你快速建立工程级调用链，而不是逐行啃代码。
+
+阅读建议
+- 第一遍只看“主调用链”和“每个文件一句话职责”。
+- 第二遍再看“关键输入/输出”和“实验改动常见入口”。
+
+============================================================
+0) 全局主调用链（先看这个）
+============================================================
+
+运行入口：
+server.py: main()
+  -> 读取配置、建模、建数据、建聚合器、建策略、建动态控制器
+  -> 启动多进程 client_proc
+  -> 循环消费 UpdateMsg
+  -> 生成候选集 + 调用 policy.decide
+  -> 调用 Aggregator.step 执行立即或缓冲聚合
+  -> flush 后更新 virtual_queue（Q_k）并写多类 CSV 日志
+
+客户端训练链：
+server.py: client_proc()
+  -> client.py: train_one_client()
+  -> 产出 delta / 训练统计
+  -> 打包成 aggregator.py: UpdateMsg 发回 server
+
+策略与聚合链（buffered 模式）：
+server.py
+  -> agg.preview_aggregation_candidate_set(...)
+  -> scafl_policy.py: 某个 Policy.decide(...)
+  -> agg.step(..., policy_decision=...)
+  -> （若 applied）server.py: apply_queue_update_for_aggregation_event(...)
+
+============================================================
+1) server.py（编排层，最高优先级）
+============================================================
+
+一句话职责
+- 整个系统的“总调度器”：接收客户端更新、触发策略决策、驱动聚合、更新运行时状态、落日志。
+
+核心被谁调用
+- 作为主程序入口被运行（main）。
+
+它调用谁
+- model.py: build_model
+- data.py: make_client_loaders
+- aggregator.py: Aggregator, UpdateMsg
+- scafl_policy.py: make_policy_from_config, 各种 objective/score 计算辅助
+- dynamic_controller.py: DynamicController.compute
+- runtime_state.py: ClientRuntimeState, BufferedUpdate, SystemState
+- client.py: train_one_client（在 client_proc 内）
+- utils.py: set_seed, make_run_dir, now_s
+
+你阅读时先盯的函数
+- main()
+  - 看配置读取、策略构造、循环收包、决策触发、聚合触发、日志时机。
+- client_proc(...)
+  - 看客户端如何拿全局模型、如何把训练结果封装成 UpdateMsg。
+- apply_queue_update_for_aggregation_event(...)
+  - 看 Q_k 的工程更新规则（candidate 范围、beta 语义、tau_max 作用）。
+- collect_system_state(...)
+  - 看动态控制器依赖的系统观测量如何统计。
+
+关键输入/输出
+- 输入：UpdateMsg（来自客户端进程）
+- 输出：
+  - 更新 shared["global_state"] 与 global_step
+  - 更新 client_states[].virtual_queue
+  - 写 metrics.csv / flush_metrics.csv / round_metrics.csv / queue_trace.csv / decision_debug.csv / p2_prefix_diagnostics.csv
+
+实验改动常见入口
+- 改策略类型与策略参数：配置 + make_policy_from_config 路径
+- 改 queue 更新语义：apply_queue_update_for_aggregation_event
+- 改日志字段：ROUND_METRICS_HEADER 及对应写入段
+
+============================================================
+2) aggregator.py（聚合执行层，第二优先级）
+============================================================
+
+一句话职责
+- 执行 server 侧模型更新（immediate 或 buffered），并维护 buffer 与 flush 行为。
+
+核心被谁调用
+- 由 server.py 的 main 循环调用：
+  - preview_aggregation_candidate_set(...)
+  - step(...)
+
+它调用谁
+- scafl_types.py: PendingUpdate / AggregationCandidateSet / PolicyDecision
+- scafl_policy.py: compute_d_k, LegacyFullBufferPolicy（当未传 policy_decision 时回退）
+- utils.py: state_dict_add_inplace
+
+关键结构
+- UpdateMsg：客户端上报消息（delta + 训练/时延统计 + update_id）
+- StepResult：一次 step 的执行结果（是否应用、是否 flush、flush 快照）
+- FlushSnapshot：flush 观测统计
+- Aggregator.buffer：[(UpdateMsg, staleness), ...]
+
+关键方法
+- _pairs_to_pending(...)
+  - 把 buffer 内部结构映射成策略侧可读的 PendingUpdate（含 d_k/staleness 等）。
+- preview_aggregation_candidate_set(...)
+  - 构造“旧 buffer + 本条消息”的候选快照，供 policy.decide。
+- step(...)
+  - 真正做接受判断、append、按决策选子集、加权聚合、删已选 buffer 行。
+
+关键输入/输出
+- 输入：global_state、UpdateMsg、staleness、policy_decision
+- 输出：
+  - 就地更新 global_state
+  - 更新 self.buffer
+  - 返回 StepResult 给 server
+
+============================================================
+3) scafl_policy.py（策略决策层，第三优先级）
+============================================================
+
+一句话职责
+- 定义策略族与决策接口：给定候选集，输出 should_flush + selected_indices + 诊断信息。
+
+核心被谁调用
+- server.py 在 buffered 场景下对每条消息调用 train_policy.decide(...)
+- aggregator.py 可能在无外部决策时回退 LegacyFullBufferPolicy.decide(...)
+
+它调用谁
+- runtime_state.py: SystemState（接口入参）
+- scafl_types.py: AggregationCandidateSet / PolicyDecision / PrefixEvaluationRecord / CandidateDecisionRecord
+
+关键函数（非类）
+- parse_policy_config / make_policy_from_config
+  - 从 YAML 解析并实例化具体 policy。
+- format_policy_params_for_log
+  - 统一日志里的 policy_params。
+- compute_d_k
+  - 统一 d_k 定义（compute_time + upload_delay）。
+- compute_scafl_p2_objective_for_prefix
+  - P2 工程目标计算核心。
+- compute_queue_aware_priority_scores
+  - queue_aware 策略的优先级打分。
+
+主要策略类（从“保守”到“更策略化”）
+- LegacyFullBufferPolicy
+  - 复刻老逻辑：满足 size/staleness 触发就全 buffer flush。
+- SortedSubsetPolicy
+  - 按 d_k 排序选 top-m 前缀。
+- QueueAwareSubsetPolicy
+  - 用 q 与 d 的加权分数选 top-m。
+- ApproxDriftPlusPenaltyPolicy
+  - 枚举前缀，最小化 V * time_term + queue_term。
+- SCAFLP2Policy
+  - 枚举前缀，按 P2 形式目标选最优。
+- SCAFLPolicy（skeleton/scafl）
+  - 结构上也属于 P2 前缀式选择，带更丰富诊断字段。
+
+关键输入/输出
+- 输入：AggregationCandidateSet + SystemState + target_size/tau_max_override + queue_by_client_id
+- 输出：PolicyDecision（是否 flush、选中索引、目标值分解、prefix 诊断）
+
+============================================================
+4) scafl_types.py（策略数据结构层）
+============================================================
+
+一句话职责
+- 承载策略与聚合之间的统一数据契约（候选、决策、诊断记录）。
+
+核心被谁调用
+- aggregator.py 构造 PendingUpdate / CandidateSet
+- scafl_policy.py 读写这些结构并返回 PolicyDecision
+- server.py 消费 PolicyDecision 及诊断字段写日志
+
+关键结构
+- PendingUpdate：单条 pending 的策略视图（含 d_k/staleness/update_id）
+- AggregationCandidateSet：一次决策的候选快照
+- PolicyDecision：策略输出主对象
+- PrefixEvaluationRecord：前缀枚举过程诊断
+- CandidateDecisionRecord：逐 candidate 决策诊断
+
+阅读重点
+- 明确字段语义是 client-level 还是 update-level（尤其 beta 与 selected_indices）
+
+============================================================
+5) runtime_state.py（运行时状态层）
+============================================================
+
+一句话职责
+- 定义 server 维护的状态对象：每客户端运行时估计、buffer 元数据快照、系统统计输入。
+
+核心被谁调用
+- server.py 创建并持续更新 ClientRuntimeState
+- server.py 用 BufferedUpdate + ClientRuntimeState 计算 SystemState
+- dynamic_controller.py 消费 SystemState
+- scafl_policy.py 通过 queue_by_client_id间接使用其中 virtual_queue
+
+关键结构
+- ClientRuntimeState：含 staleness/compute/upload/virtual_queue
+- BufferedUpdate：给统计函数用的缓冲元数据
+- SystemState：控制器输入统计
+
+============================================================
+6) dynamic_controller.py（动态阈值层）
+============================================================
+
+一句话职责
+- 根据 SystemState 计算本轮动态控制输出（tau_max_t, buffer_target_t）。
+
+核心被谁调用
+- server.py 在每条更新到达后调用 controller.compute(...)
+
+它调用谁
+- runtime_state.py: SystemState
+
+关键输出
+- DynamicControlOutput:
+  - tau_max_t
+  - buffer_target_t
+  - delay/heter/staleness score（用于日志可解释性）
+
+阅读重点
+- enabled 开关与各系数如何影响 tau 与 buffer 目标
+- clip 范围如何约束最终控制量
+
+============================================================
+7) client.py（客户端本地训练层）
+============================================================
+
+一句话职责
+- 在客户端侧执行本地 SGD，产出模型增量 delta 与训练/时延统计。
+
+核心被谁调用
+- server.py 的 client_proc(...)
+
+它调用谁
+- utils.py: state_dict_sub
+- torch SGD / loss / grad clip
+
+关键输入/输出
+- 输入：base_state、loader、本地训练超参
+- 输出：delta, num_samples, local_epochs, train_started_at, train_finished_at, sent_at, train_loss
+
+阅读重点
+- delta 计算与 norm clip
+- 统计字段的语义（这些会直接进 UpdateMsg 和日志）
+
+============================================================
+8) data.py（数据准备层）
+============================================================
+
+一句话职责
+- 加载 MNIST，并生成 IID/Non-IID 客户端 DataLoader。
+
+核心被谁调用
+- server.py: make_client_loaders(...)
+
+关键函数
+- load_mnist
+- non_iid_shards
+- make_client_loaders
+
+阅读重点
+- non_iid 切分规则与随机种子（影响实验可重复性）
+
+============================================================
+9) model.py（模型定义层）
+============================================================
+
+一句话职责
+- 定义可训练模型结构并提供统一构造入口。
+
+核心被谁调用
+- server.py（全局模型）
+- client.py（本地训练模型副本）
+
+关键函数
+- build_model(name)
+
+阅读重点
+- 当前只支持 MLP；若扩展模型，入口就在这里
+
+============================================================
+10) utils.py（通用工具层）
+============================================================
+
+一句话职责
+- 提供随机种子、运行目录、state_dict 张量运算等通用工具。
+
+核心被谁调用
+- server.py: set_seed, make_run_dir, now_s
+- client.py: state_dict_sub
+- aggregator.py: state_dict_add_inplace
+
+关键函数
+- set_seed
+- make_run_dir
+- state_dict_sub
+- state_dict_add_inplace
+
+============================================================
+11) 建议的“函数级点读顺序”（最省时）
+============================================================
+
+第一轮（30~45 分钟）
+1. server.py: main
+2. server.py: client_proc
+3. aggregator.py: step
+4. scafl_policy.py: make_policy_from_config + 你当前 policy 的 decide
+
+第二轮（45~60 分钟）
+5. server.py: apply_queue_update_for_aggregation_event
+6. scafl_policy.py: compute_scafl_p2_objective_for_prefix
+7. aggregator.py: preview_aggregation_candidate_set + _pairs_to_pending
+8. dynamic_controller.py: DynamicController.compute
+
+第三轮（20~30 分钟）
+9. runtime_state.py 全部 dataclass
+10. scafl_types.py 全部 dataclass
+11. data.py / client.py / utils.py / model.py 快速扫读
+
+============================================================
+12) 快速定位“我该改哪里”
+============================================================
+
+想改“策略行为”
+- 首看 scafl_policy.py（对应策略类 decide）
+- 再看 server.py 中 train_policy.decide 调用上下文
+
+想改“聚合方式/加权”
+- 首看 aggregator.py: step
+
+想改“Q_k 更新规则”
+- 首看 server.py: apply_queue_update_for_aggregation_event
+
+想改“动态阈值（tau_max / buffer_target）”
+- 首看 dynamic_controller.py + server.py 的 controller.compute 调用处
+
+想改“实验日志字段”
+- 首看 server.py 的 *_HEADER 常量与写 CSV 段
+
+============================================================
+13) 读懂标志（自测）
+============================================================
+
+如果你能回答以下问题，就可以进入实验阶段：
+- 一条 UpdateMsg 从产生到被聚合，完整经过哪些函数？
+- selected_indices 与 selected_client_ids 的粒度差异是什么？
+- buffered flush 后，Q_k 在哪里、按什么规则更新？
+- round_metrics / decision_debug / p2_prefix_diagnostics 的字段分别来自哪些函数？
+

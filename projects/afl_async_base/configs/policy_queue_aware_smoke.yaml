@@ -1,0 +1,35 @@
+# Queue-aware 子集策略最小验证：virtual_queue 参与 priority，与纯 d_k 的 sorted_subset 对照用。
+# 期望：round_metrics 中 policy_type=queue_aware，avg_selected_score 非零（候选足够且 flush 时），
+# 且当各客户端 q 差异大时，选中集更偏向高 q（在 d_k 相近时更明显）。
+seed: 42
+num_clients: 4
+updates_per_client: 20
+dataset: MNIST
+data_dir: /home/kamila/SCAFL/data/mnist_smoke
+non_iid: false
+num_shards: 4
+model: mlp
+batch_size: 64
+local_epochs: 1
+local_lr: 0.01
+momentum: 0.9
+weight_decay: 0.0001
+grad_clip: 5.0
+server_lr: 0.3
+async_mode: buffered
+buffer_size: 99
+staleness_weight: exp
+staleness_lambda: 0.2
+staleness_cutoff: 12
+dynamic_control:
+  enabled: false
+eval_every: 1
+log_root: /home/kamila/SCAFL/logs/policy_queue_aware_smoke
+device: cpu
+
+policy:
+  type: queue_aware
+  min_select_size: 4
+  select_size: 2
+  alpha: 1.0
+  beta: 1.0

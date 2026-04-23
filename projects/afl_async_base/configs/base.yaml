@@ -1,0 +1,78 @@
+# ===== Reproducibility =====
+seed: 42
+
+# ===== Federated setting =====
+num_clients: 5
+updates_per_client: 80
+
+# ===== Dataset =====
+dataset: MNIST
+data_dir: /mnt/e/SCAFL/data/raw
+
+# ===== Data partition =====
+non_iid: true
+num_shards: 20        # each client gets multiple shards (less extreme non-IID)
+
+# ===== Model & training =====
+model: mlp
+batch_size: 128
+local_epochs: 1
+local_lr: 0.005
+momentum: 0.9
+weight_decay: 0.0001
+grad_clip: 5.0
+
+# ===== Async federated learning (server side) =====
+server_lr: 0.3
+
+# async_mode: immediate | buffered
+async_mode: buffered
+buffer_size: 8
+
+# ===== Aggregation policy (buffered only; default legacy) =====
+# type: legacy | scafl_skeleton | sorted_subset | queue_aware | approx_drift_penalty | scafl_p2
+policy:
+  type: legacy
+  min_select_size: 4
+  select_size: 4
+  max_select_size: 6
+  V: 1.0
+  # queue_aware 专用：alpha/beta 为 priority = beta*q_norm - alpha*d_norm
+  alpha: 1.0
+  beta: 1.0
+
+# ===== Staleness control =====
+staleness_weight: exp     # none | inv | exp
+staleness_lambda: 0.2
+staleness_cutoff: 8
+
+# ===== Dynamic control (first-innovation-point Step2) =====
+dynamic_control:
+  enabled: true
+  # tau control range
+  tau_min: 1
+  tau_base: 8
+  tau_max_limit: 32
+  # buffer target range
+  buffer_min: 1
+  buffer_base: 8
+  buffer_max: 32
+  # normalization refs
+  delay_ref: 1.0
+  heter_ref: 1.0
+  staleness_ref: 1.0
+  # linear coefficients for tau: tau_raw = tau_base - sum(coeff * score)
+  tau_coeff_delay: 0.5
+  tau_coeff_heter: 0.5
+  tau_coeff_staleness: 0.5
+  # linear coefficients for buffer: buffer_raw = buffer_base - sum(coeff * score)
+  buffer_coeff_delay: 0.5
+  buffer_coeff_heter: 0.5
+  buffer_coeff_staleness: 0.5
+
+# ===== Evaluation & logging =====
+eval_every: 5
+log_root: /home/kamila/SCAFL/logs/afl_async_base
+
+# ===== Device =====
+device: cuda

@@ -1,0 +1,31 @@
+seed: 42
+num_clients: 4
+updates_per_client: 24
+dataset: MNIST
+data_dir: /home/kamila/SCAFL/data/mnist_smoke
+non_iid: false
+num_shards: 4
+model: mlp
+batch_size: 64
+local_epochs: 1
+local_lr: 0.01
+momentum: 0.9
+weight_decay: 0.0001
+grad_clip: 5.0
+server_lr: 0.3
+async_mode: buffered
+buffer_size: 99
+staleness_weight: exp
+staleness_lambda: 0.2
+staleness_cutoff: 12
+dynamic_control:
+  enabled: false
+eval_every: 1
+log_root: /home/kamila/SCAFL/logs/policy_scafl_p2_smoke
+device: cpu
+
+policy:
+  type: scafl_p2
+  min_select_size: 4
+  max_select_size: 6
+  V: 1.0

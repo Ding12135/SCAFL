@@ -1,0 +1,22 @@
+[
+  {
+    "label": "① buffered + exp + 动态控制",
+    "config": "configs/ppt/01_buffered_dynamic.yaml",
+    "run_dir": "/home/kamila/SCAFL/logs/ppt_prepared/01_buffered_dynamic/20260323-000915"
+  },
+  {
+    "label": "② immediate + exp",
+    "config": "configs/ppt/02_immediate.yaml",
+    "run_dir": "/home/kamila/SCAFL/logs/ppt_prepared/02_immediate/20260323-001802"
+  },
+  {
+    "label": "③ buffered + 关动态",
+    "config": "configs/ppt/03_buffered_no_dynamic.yaml",
+    "run_dir": "/home/kamila/SCAFL/logs/ppt_prepared/03_buffered_no_dynamic/20260323-002653"
+  },
+  {
+    "label": "④ buffered + staleness none",
+    "config": "configs/ppt/04_staleness_none.yaml",
+    "run_dir": "/home/kamila/SCAFL/logs/ppt_prepared/04_staleness_none/20260323-003541"
+  }
+]

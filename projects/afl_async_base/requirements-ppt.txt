@@ -1,0 +1,2 @@
+# 仅用于 scripts/plot_ppt_results.py 出图
+matplotlib>=3.7

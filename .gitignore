@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.venv/
+venv/
+.env
+
+# Data & experiment outputs (regenerate locally)
+data/
+logs/
+
+# Local tooling / installers — never version-control
+software/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

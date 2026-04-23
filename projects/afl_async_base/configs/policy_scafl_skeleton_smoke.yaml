@@ -1,0 +1,38 @@
+seed: 42
+num_clients: 4
+updates_per_client: 12
+dataset: MNIST
+data_dir: /home/kamila/SCAFL/data/mnist_smoke
+non_iid: false
+num_shards: 4
+model: mlp
+batch_size: 64
+local_epochs: 1
+local_lr: 0.01
+momentum: 0.9
+weight_decay: 0.0001
+grad_clip: 5.0
+server_lr: 0.3
+async_mode: buffered
+buffer_size: 99
+staleness_weight: exp
+staleness_lambda: 0.2
+staleness_cutoff: 12
+dynamic_control:
+  enabled: false
+  buffer_base: 1
+  buffer_min: 1
+  buffer_max: 4
+  tau_base: 0
+  tau_min: 0
+  tau_max_limit: 0
+eval_every: 9999
+log_root: /home/kamila/SCAFL/logs/policy_scafl_skeleton_smoke
+device: cpu
+
+policy:
+  type: scafl_skeleton
+  min_select_size: 2
+  d_zero_eps: 1.0e-12
+  # Lyapunov 时间项权重 V（与论文 P2 中 V·D_t 一致；见 docs/paper_symbol_mapping.md）
+  V: 1.0
