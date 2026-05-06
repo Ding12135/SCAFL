@@ -27,10 +27,10 @@ class DynamicControlOutput:
 
 class DynamicController:
     """
-    A first-version linear controller:
-    - Normalize SystemState into three scores (delay/heterogeneity/staleness)
-    - Compute raw tau/buffer targets as base - coeff * score
-    - Clip to [min, max] ranges
+    Baseline 线性动态控制：
+    - 将 SystemState 归一化为 delay / heterogeneity / staleness 三项 score
+    - tau：delay/heter 升高时放宽（+），平均 buffer 陈旧度升高时收紧（−）
+    - buffer_target：三项升高时减小目标批量（−），再 clip 到配置区间
     """
 
     def __init__(self, cfg: dict):
@@ -79,11 +79,12 @@ class DynamicController:
             tau_raw = float(self.tau_base)
             buffer_raw = float(self.buffer_base)
         else:
-            # Linear rule with clip.
+            # Baseline：上传延迟与异构升高时放宽 tau，缓冲平均陈旧度升高时收紧 tau；
+            # buffer_target 在拥塞/陈旧时变小以少等待。
             tau_raw = (
                 float(self.tau_base)
-                - self.tau_coeff_delay * delay_score
-                - self.tau_coeff_heter * heter_score
+                + self.tau_coeff_delay * delay_score
+                + self.tau_coeff_heter * heter_score
                 - self.tau_coeff_staleness * staleness_score
             )
             buffer_raw = (

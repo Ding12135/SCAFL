@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Set, TextIO
 
 from .model import build_model
 from .data import make_client_loaders
-from .aggregator import Aggregator, UpdateMsg
+from .aggregator import Aggregator, StepResult, UpdateMsg
 from .runtime_state import ClientRuntimeState, BufferedUpdate, SystemState
 from .dynamic_controller import DynamicController
 from .scafl_policy import (
@@ -345,6 +345,57 @@ def collect_system_state(
     )
 
 
+def collect_system_state_from_candidate_set(
+    client_states: Dict[int, ClientRuntimeState],
+    candidate_set: AggregationCandidateSet,
+) -> SystemState:
+    """
+    由 preview 得到的 candidate_set（旧 buffer + incoming）构造 SystemState，
+    不依赖 metadata_buffer。
+    """
+    stalenesses = [int(item.staleness) for item in candidate_set.items]
+    buffer_size = len(stalenesses)
+    avg_buffer_staleness = (
+        float(sum(stalenesses) / buffer_size) if buffer_size else 0.0
+    )
+    max_buffer_staleness = max(stalenesses) if buffer_size else 0
+
+    compute_times = [
+        float(cs.estimated_compute_time)
+        for cs in client_states.values()
+        if getattr(cs, "estimated_compute_time", 0.0) > 0.0
+    ]
+    upload_delays = [
+        float(cs.estimated_upload_delay)
+        for cs in client_states.values()
+        if getattr(cs, "estimated_upload_delay", 0.0) > 0.0
+    ]
+
+    avg_compute_time = (
+        float(sum(compute_times) / len(compute_times)) if compute_times else 0.0
+    )
+    avg_upload_delay = (
+        float(sum(upload_delays) / len(upload_delays)) if upload_delays else 0.0
+    )
+
+    if compute_times:
+        mean_ct = avg_compute_time
+        compute_heterogeneity = (
+            sum((x - mean_ct) ** 2 for x in compute_times) / len(compute_times)
+        ) ** 0.5
+    else:
+        compute_heterogeneity = 0.0
+
+    return SystemState(
+        avg_upload_delay=avg_upload_delay,
+        avg_compute_time=avg_compute_time,
+        compute_heterogeneity=compute_heterogeneity,
+        buffer_size=buffer_size,
+        avg_buffer_staleness=avg_buffer_staleness,
+        max_buffer_staleness=max_buffer_staleness,
+    )
+
+
 @torch.no_grad()
 def evaluate(model, test_loader, device: str):
     model.eval()
@@ -438,6 +489,16 @@ METRICS_HEADER = [
     "beta_k",
     "test_acc",
     "test_loss",
+    "logical_round",
+    "selected_count",
+    "flushed_count",
+    "remaining_buffer_count",
+    "avg_buffer_staleness",
+    "max_buffer_staleness",
+    "avg_sys_compute_time",
+    "avg_sys_upload_delay",
+    "sys_compute_heterogeneity",
+    "dropped_stale_count",
 ]
 
 FLUSH_METRICS_HEADER = [
@@ -835,8 +896,6 @@ def main():
         total_msgs_target = cfg["num_clients"] * cfg["updates_per_client"]
         recv_step = 0
         applied_updates = 0
-        update_seq = 0  # for update_id lifecycle tracking
-
         last_test_acc = -1.0
         last_test_loss = -1.0
 
@@ -902,19 +961,6 @@ def main():
             compute_time_sum += compute_time
             upload_delay_sum += upload_delay
 
-            # === update_id：只在该条消息会进入 Aggregator buffer 时生成 ===
-            # 进入条件：staleness 通过 Aggregator 的 cutoff 接受逻辑。
-            if cfg["async_mode"] == "buffered" and agg._accept(int(staleness)):
-                update_seq += 1
-                msg.update_id = (
-                    f"u{update_seq:08d}-c{int(msg.client_id)}-bs{int(msg.base_step)}"
-                )
-                # 语义：该条消息首次进入 buffer 的 logical_round（工程近似为当前 completed_flush_rounds）。
-                msg.entered_buffer_round = int(completed_flush_rounds)
-            else:
-                msg.update_id = ""
-                msg.entered_buffer_round = -1
-
             bu = BufferedUpdate(
                 client_id=msg.client_id,
                 base_step=int(msg.base_step),
@@ -934,7 +980,30 @@ def main():
             cs.estimated_compute_time = compute_time
             cs.estimated_upload_delay = upload_delay
 
-            system_state = collect_system_state(client_states, metadata_buffer)
+            if cfg["async_mode"] == "buffered":
+                msg.update_id = (
+                    f"c{int(msg.client_id)}_b{int(msg.base_step)}_r{int(completed_flush_rounds)}"
+                )
+                msg.entered_buffer_round = int(completed_flush_rounds)
+            else:
+                msg.update_id = ""
+                msg.entered_buffer_round = -1
+
+            candidate_set: Optional[AggregationCandidateSet] = None
+            last_candidate_count = 0
+            if cfg["async_mode"] == "buffered":
+                candidate_set = agg.preview_aggregation_candidate_set(
+                    msg,
+                    staleness,
+                    completed_flush_rounds,
+                    gs_before,
+                )
+                last_candidate_count = len(candidate_set.items)
+                system_state = collect_system_state_from_candidate_set(
+                    client_states, candidate_set
+                )
+            else:
+                system_state = collect_system_state(client_states, metadata_buffer)
 
             delta_norm = _delta_l2_norm(msg.delta)
 
@@ -951,63 +1020,91 @@ def main():
                 f"staleness_score={ctrl.staleness_score:.6f}"
             )
 
-            buffer_target_override = ctrl.buffer_target_t if cfg["async_mode"] == "buffered" else None
-            tau_max_override = ctrl.tau_max_t if cfg["async_mode"] == "buffered" else None
+            buffer_target_override: Optional[int] = None
+            tau_max_override: Optional[int] = None
+            if cfg["async_mode"] == "buffered":
+                if not controller.enabled:
+                    tau_max_override = int(cfg.get("staleness_cutoff", -1))
+                    buffer_target_override = int(cfg.get("buffer_size", 8))
+                else:
+                    tau_max_override = int(ctrl.tau_max_t)
+                    buffer_target_override = int(ctrl.buffer_target_t)
+            else:
+                if not controller.enabled:
+                    tau_max_override = int(cfg.get("staleness_cutoff", -1))
+                else:
+                    tau_max_override = int(ctrl.tau_max_t)
 
-            # client_id -> virtual_queue（Q_k 工程近似）；供 queue_aware policy 显式使用，后续对齐论文 Q_k(t)。
             queue_by_client_id: Dict[int, float] = {
                 int(cid): float(cs.virtual_queue) for cid, cs in client_states.items()
             }
 
             policy_decision = None
-            last_candidate_count = 0
-            candidate_set = None
+            accepted_by_server_tau = True
             if cfg["async_mode"] == "buffered":
-                candidate_set = agg.preview_aggregation_candidate_set(
-                    msg,
-                    staleness,
-                    completed_flush_rounds,
-                    gs_before,
-                )
-                last_candidate_count = len(candidate_set.items)
-                target_sz = (
-                    int(buffer_target_override)
-                    if buffer_target_override is not None
-                    else int(agg.buffer_size)
-                )
-                policy_decision = train_policy.decide(
-                    candidate_set,
-                    system_state,
-                    target_size=target_sz,
-                    tau_max_override=tau_max_override,
-                    queue_by_client_id=queue_by_client_id,
-                )
+                accepted_by_server_tau = agg._accept(int(staleness), tau_max_override)
+                if not accepted_by_server_tau:
+                    print(
+                        f"[SERVER] drop incoming client_id={msg.client_id} staleness={int(staleness)} "
+                        f"tau_max_t={tau_max_override} buffer_target_t={buffer_target_override} "
+                        f"accepted=False dropped=True"
+                    )
+                else:
+                    assert candidate_set is not None
+                    target_sz = (
+                        int(buffer_target_override)
+                        if buffer_target_override is not None
+                        else int(agg.buffer_size)
+                    )
+                    policy_decision = train_policy.decide(
+                        candidate_set,
+                        system_state,
+                        target_size=target_sz,
+                        tau_max_override=tau_max_override,
+                        queue_by_client_id=queue_by_client_id,
+                    )
 
             with lock:
                 buffer_len_before = len(agg.buffer)
                 max_staleness_agg_before = max((s for _, s in agg.buffer), default=0)
 
-                step_result = agg.step(
-                    shared["global_state"],
-                    msg,
-                    staleness,
-                    buffer_target_override=buffer_target_override,
-                    tau_max_override=tau_max_override,
-                    policy_decision=policy_decision,
-                    logical_round=completed_flush_rounds,
-                    global_step=gs_before,
-                )
-                applied = step_result.applied
-                accepted = step_result.accepted
-                triggered_flush = step_result.triggered_flush
-                buffer_len_after = len(agg.buffer)
-                max_staleness_agg_after = max((s for _, s in agg.buffer), default=0)
+                if cfg["async_mode"] == "buffered" and not accepted_by_server_tau:
+                    step_result = StepResult(
+                        applied=False,
+                        accepted=False,
+                        triggered_flush=False,
+                        flush_reason="server_drop_incoming_by_dynamic_tau",
+                        flush_snapshot=None,
+                        remaining_buffer_count=buffer_len_before,
+                    )
+                    applied = False
+                    accepted = False
+                    triggered_flush = False
+                    buffer_len_after = buffer_len_before
+                    max_staleness_agg_after = max_staleness_agg_before
+                    global_step_after = int(shared["global_step"])
+                else:
+                    step_result = agg.step(
+                        shared["global_state"],
+                        msg,
+                        staleness,
+                        buffer_target_override=buffer_target_override,
+                        tau_max_override=tau_max_override,
+                        policy_decision=policy_decision,
+                        logical_round=completed_flush_rounds,
+                        global_step=gs_before,
+                    )
+                    applied = step_result.applied
+                    accepted = step_result.accepted
+                    triggered_flush = step_result.triggered_flush
+                    buffer_len_after = len(agg.buffer)
+                    max_staleness_agg_after = max((s for _, s in agg.buffer), default=0)
 
-                if applied:
-                    shared["global_step"] = gs_before + 1
-                    applied_updates += 1
+                    if applied:
+                        shared["global_step"] = gs_before + 1
+                        applied_updates += 1
 
-                global_step_after = int(shared["global_step"])
+                    global_step_after = int(shared["global_step"])
 
             if accepted:
                 accepted_count += 1
@@ -1015,8 +1112,8 @@ def main():
             dropped_by_cutoff = 0 if accepted else 1
             if dropped_by_cutoff:
                 print(
-                    f"[WARNING] update dropped_by_cutoff=1 client_id={msg.client_id} "
-                    f"staleness={int(staleness)} cutoff={agg.staleness_cutoff}"
+                    f"[WARNING] update dropped client_id={msg.client_id} staleness={int(staleness)} "
+                    f"tau_max_t={tau_max_override} accepted={int(accepted)}"
                 )
 
             flush_reason_str = step_result.flush_reason if step_result.flush_reason else ""
@@ -1067,8 +1164,12 @@ def main():
                             snap.avg_compute_time,
                             snap.avg_upload_delay,
                             snap.total_samples,
-                            int(ctrl.buffer_target_t),
-                            int(ctrl.tau_max_t),
+                            int(buffer_target_override)
+                            if buffer_target_override is not None
+                            else int(ctrl.buffer_target_t),
+                            int(tau_max_override)
+                            if tau_max_override is not None
+                            else int(ctrl.tau_max_t),
                         ]
                     )
 
@@ -1358,6 +1459,17 @@ def main():
 
             wall_time = now_s() - start_t
 
+            log_buf_t = (
+                int(buffer_target_override)
+                if buffer_target_override is not None
+                else int(ctrl.buffer_target_t)
+            )
+            log_tau_t = (
+                int(tau_max_override)
+                if tau_max_override is not None
+                else int(ctrl.tau_max_t)
+            )
+
             with open(metrics_path, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(
                     [
@@ -1375,8 +1487,8 @@ def main():
                         buffer_len_before,
                         buffer_len_after,
                         metadata_buffer_len,
-                        int(ctrl.buffer_target_t),
-                        int(ctrl.tau_max_t),
+                        log_buf_t,
+                        log_tau_t,
                         ctrl.delay_score,
                         ctrl.heter_score,
                         ctrl.staleness_score,
@@ -1389,6 +1501,16 @@ def main():
                         int(beta_k),
                         test_acc_row,
                         test_loss_row,
+                        int(completed_flush_rounds),
+                        int(step_result.selected_count),
+                        int(step_result.flushed_count),
+                        int(step_result.remaining_buffer_count),
+                        float(system_state.avg_buffer_staleness),
+                        int(system_state.max_buffer_staleness),
+                        float(system_state.avg_compute_time),
+                        float(system_state.avg_upload_delay),
+                        float(system_state.compute_heterogeneity),
+                        int(step_result.dropped_stale_count),
                     ]
                 )
 

@@ -100,8 +100,10 @@ def make_policy_from_config(cfg: Any) -> Tuple[object, Dict[str, Any]]:
         )
     if ptype == "legacy":
         return LegacyFullBufferPolicy(), pc
+    if ptype == "dynamic_threshold":
+        return DynamicThresholdBufferPolicy(), pc
     raise ValueError(
-        f"Unknown policy.type: {ptype!r} (use 'legacy', 'scafl_skeleton', "
+        f"Unknown policy.type: {ptype!r} (use 'legacy', 'dynamic_threshold', 'scafl_skeleton', "
         f"'sorted_subset', 'queue_aware', 'approx_drift_penalty', or 'scafl_p2')"
     )
 
@@ -128,6 +130,8 @@ def format_policy_params_for_log(pc: Dict[str, Any]) -> str:
         parts.append(f"min_select_size={pc.get('min_select_size', '')}")
         parts.append(f"max_select_size={pc.get('max_select_size', '')}")
         parts.append(f"V={pc.get('V', '')}")
+    if t == "dynamic_threshold":
+        parts.append("threshold_buffer_baseline=1")
     return ";".join(parts)
 
 
@@ -253,7 +257,9 @@ class LegacyFullBufferPolicy:
         max_s = max(pu.staleness for pu in items)
         size_trigger = n >= target_size
         staleness_trigger = (
-            tau_max_override is not None and max_s >= int(tau_max_override)
+            tau_max_override is not None
+            and int(tau_max_override) >= 0
+            and max_s >= int(tau_max_override)
         )
         should_flush = size_trigger or staleness_trigger
 
@@ -280,6 +286,90 @@ class LegacyFullBufferPolicy:
             should_flush=True,
             selected_indices=indices,
             selected_client_ids=[items[i].client_id for i in indices],
+            tau_max=tau_max_override,
+            buffer_target=target_size,
+            reason=reason,
+            drop_unselected=False,
+        )
+
+
+class DynamicThresholdBufferPolicy:
+    """
+    Dynamic Staleness-Threshold Buffered AFL baseline：
+    按 buffer_target 与 tau_max 触发 flush，并按 staleness<=tau 选子集（tau<0 时全选）。
+    """
+
+    def decide(
+        self,
+        candidates: AggregationCandidateSet,
+        system_state: Optional[SystemState] = None,
+        *,
+        target_size: int,
+        tau_max_override: Optional[int],
+        queue_by_client_id: Optional[Dict[int, float]] = None,
+    ) -> PolicyDecision:
+        _ = (system_state, queue_by_client_id)
+        items = candidates.items
+        n = len(items)
+        target = int(target_size) if target_size is not None else n
+
+        if n == 0:
+            return PolicyDecision(
+                should_flush=False,
+                selected_indices=None,
+                selected_client_ids=None,
+                tau_max=tau_max_override,
+                buffer_target=target_size,
+                reason="empty_buffer",
+                drop_unselected=False,
+            )
+
+        stalenesses = [int(item.staleness) for item in items]
+        max_s = max(stalenesses)
+
+        trigger_by_size = n >= target
+        trigger_by_tau = (
+            tau_max_override is not None
+            and int(tau_max_override) >= 0
+            and max_s >= int(tau_max_override)
+        )
+
+        should_flush = trigger_by_size or trigger_by_tau
+
+        if not should_flush:
+            return PolicyDecision(
+                should_flush=False,
+                selected_indices=None,
+                selected_client_ids=None,
+                tau_max=tau_max_override,
+                buffer_target=target_size,
+                reason="not_triggered",
+                drop_unselected=False,
+            )
+
+        if tau_max_override is None or int(tau_max_override) < 0:
+            selected_indices = list(range(n))
+        else:
+            selected_indices = [
+                i
+                for i, item in enumerate(items)
+                if int(item.staleness) <= int(tau_max_override)
+            ]
+
+        if len(selected_indices) == 0:
+            selected_indices = [min(range(n), key=lambda i: int(items[i].staleness))]
+
+        if trigger_by_size and trigger_by_tau:
+            reason = "dynamic_buffer_and_staleness"
+        elif trigger_by_size:
+            reason = "dynamic_buffer_target"
+        else:
+            reason = "dynamic_staleness_threshold"
+
+        return PolicyDecision(
+            should_flush=True,
+            selected_indices=selected_indices,
+            selected_client_ids=[int(items[i].client_id) for i in selected_indices],
             tau_max=tau_max_override,
             buffer_target=target_size,
             reason=reason,

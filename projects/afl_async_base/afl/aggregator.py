@@ -4,7 +4,7 @@ import math
 import torch
 from .utils import state_dict_add_inplace
 from .scafl_types import AggregationCandidateSet, PendingUpdate, PolicyDecision
-from .scafl_policy import LegacyFullBufferPolicy, compute_d_k
+from .scafl_policy import DynamicThresholdBufferPolicy, compute_d_k
 
 
 @dataclass
@@ -70,6 +70,7 @@ class StepResult:
     selected_count: int = 0
     remaining_buffer_count: int = 0
     policy_logical_round: Optional[int] = None
+    dropped_stale_count: int = 0
 
 
 class Aggregator:
@@ -99,8 +100,35 @@ class Aggregator:
             return math.exp(-self.staleness_lambda * s)
         raise ValueError("Unknown staleness_weight")
 
-    def _accept(self, s: int):
-        return self.staleness_cutoff < 0 or s <= self.staleness_cutoff
+    def _effective_cutoff(self, tau_max_override: Optional[int] = None) -> int:
+        if tau_max_override is not None:
+            return int(tau_max_override)
+        return int(self.staleness_cutoff)
+
+    def _accept(self, s: int, tau_max_override: Optional[int] = None) -> bool:
+        cutoff = self._effective_cutoff(tau_max_override)
+        return cutoff < 0 or int(s) <= cutoff
+
+    def _current_staleness(self, msg: UpdateMsg, global_step: int) -> int:
+        return max(0, int(global_step) - int(msg.base_step))
+
+    def _refresh_buffer_staleness(self, global_step: int) -> None:
+        self.buffer = [
+            (m, self._current_staleness(m, global_step)) for m, _s in self.buffer
+        ]
+
+    def _prune_buffer_by_tau(self, tau_max_override: Optional[int]) -> int:
+        if tau_max_override is None:
+            return 0
+        kept: List[Tuple[UpdateMsg, int]] = []
+        dropped = 0
+        for m, s in self.buffer:
+            if self._accept(s, tau_max_override):
+                kept.append((m, s))
+            else:
+                dropped += 1
+        self.buffer = kept
+        return dropped
 
     def _pairs_to_pending(self, pairs: List[Tuple[UpdateMsg, int]]) -> List[PendingUpdate]:
         """将 (UpdateMsg, staleness) 列表转为 PendingUpdate（d_k 为占位定义）。"""
@@ -138,10 +166,14 @@ class Aggregator:
         global_step: int,
     ) -> AggregationCandidateSet:
         """
-        在未 append 前构造「旧 buffer + 本条」候选集，供策略 decide 使用。
-        须与随后 step() 内先 append 再决策的状态一致。
+        在未 append 前构造「旧 buffer + 本条」候选集，供策略 decide 与 DynamicController 使用。
+        preview 不修改 self.buffer；buffer 内陈旧度按当前 global_step 重算，
+        incoming 使用 server 传入的 staleness（与 step() 开头 _refresh_buffer_staleness 一致）。
         """
-        virtual = list(self.buffer) + [(msg, staleness)]
+        refreshed_buffer = [
+            (m, self._current_staleness(m, global_step)) for m, _s in self.buffer
+        ]
+        virtual = refreshed_buffer + [(msg, int(staleness))]
         items = self._pairs_to_pending(virtual)
         return AggregationCandidateSet(
             items=items,
@@ -150,14 +182,13 @@ class Aggregator:
             global_step=global_step,
         )
 
-    def _build_legacy_decision_after_append(
+    def _fallback_dynamic_threshold_after_append(
         self,
         logical_round: int,
         global_step: int,
         target_size: int,
         tau_max_override: Optional[int],
     ) -> PolicyDecision:
-        """当前兼容：append 后 buffer 与 preview 一致，用 Legacy 生成决策。"""
         items = self._pairs_to_pending(self.buffer)
         cs = AggregationCandidateSet(
             items=items,
@@ -165,7 +196,7 @@ class Aggregator:
             logical_round=logical_round,
             global_step=global_step,
         )
-        return LegacyFullBufferPolicy().decide(
+        return DynamicThresholdBufferPolicy().decide(
             cs,
             None,
             target_size=target_size,
@@ -183,17 +214,19 @@ class Aggregator:
         logical_round: int = 0,
         global_step: int = 0,
     ) -> StepResult:
-        if not self._accept(staleness):
-            print(f"[AGG] drop update from client {msg.client_id}, staleness={staleness}")
-            return StepResult(
-                applied=False,
-                accepted=False,
-                triggered_flush=False,
-                flush_reason=None,
-                flush_snapshot=None,
-            )
-
         if self.async_mode == "immediate":
+            if not self._accept(staleness, tau_max_override):
+                print(
+                    f"[AGG] drop immediate update from client {msg.client_id}, "
+                    f"staleness={staleness}, tau_max_t={tau_max_override}"
+                )
+                return StepResult(
+                    applied=False,
+                    accepted=False,
+                    triggered_flush=False,
+                    flush_reason="drop_incoming_by_dynamic_tau",
+                    flush_snapshot=None,
+                )
             w = max(self._weight(staleness), 0.05)
             print(f"[AGG] apply immediate update, w={w:.3f}")
             state_dict_add_inplace(global_state, msg.delta, self.server_lr * w)
@@ -205,9 +238,34 @@ class Aggregator:
                 flush_snapshot=None,
             )
 
-        self.buffer.append((msg, staleness))
+        self._refresh_buffer_staleness(global_step)
+
+        if not self._accept(staleness, tau_max_override):
+            print(
+                f"[AGG] drop incoming update from client {msg.client_id}, "
+                f"staleness={staleness}, tau_max_t={tau_max_override}"
+            )
+            return StepResult(
+                applied=False,
+                accepted=False,
+                triggered_flush=False,
+                flush_reason="drop_incoming_by_dynamic_tau",
+                flush_snapshot=None,
+                remaining_buffer_count=len(self.buffer),
+            )
+
+        dropped_old = self._prune_buffer_by_tau(tau_max_override)
+        if dropped_old > 0:
+            print(
+                f"[AGG] prune {dropped_old} stale buffered updates by tau_max_t={tau_max_override}"
+            )
+
+        self.buffer.append((msg, int(staleness)))
+
         target_size = (
-            buffer_target_override if buffer_target_override is not None else self.buffer_size
+            buffer_target_override
+            if buffer_target_override is not None
+            else self.buffer_size
         )
         max_buffer_staleness = max(s for _, s in self.buffer) if self.buffer else 0
         print(
@@ -215,7 +273,7 @@ class Aggregator:
         )
 
         if policy_decision is None:
-            policy_decision = self._build_legacy_decision_after_append(
+            policy_decision = self._fallback_dynamic_threshold_after_append(
                 logical_round=logical_round,
                 global_step=global_step,
                 target_size=target_size,
@@ -229,6 +287,8 @@ class Aggregator:
                 triggered_flush=False,
                 flush_reason=None,
                 flush_snapshot=None,
+                remaining_buffer_count=len(self.buffer),
+                dropped_stale_count=int(dropped_old),
             )
 
         buf_len = len(self.buffer)
@@ -315,4 +375,5 @@ class Aggregator:
             selected_count=n_u,
             remaining_buffer_count=remaining,
             policy_logical_round=logical_round,
+            dropped_stale_count=int(dropped_old),
         )

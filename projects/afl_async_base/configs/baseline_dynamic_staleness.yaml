@@ -1,0 +1,66 @@
+# Dynamic Staleness-Threshold Buffered AFL baseline（基于 base.yaml，覆盖异步/策略/动态控制段）
+seed: 42
+
+num_clients: 2
+updates_per_client: 12
+
+dataset: MNIST
+data_dir: /home/kamila/SCAFL/data/raw
+
+non_iid: true
+num_shards: 20
+
+model: mlp
+batch_size: 128
+local_epochs: 1
+local_lr: 0.005
+momentum: 0.9
+weight_decay: 0.0001
+grad_clip: 5.0
+
+server_lr: 0.3
+
+async_mode: buffered
+buffer_size: 8
+
+policy:
+  type: dynamic_threshold
+  min_select_size: 4
+  select_size: 4
+  max_select_size: 6
+  V: 1.0
+  alpha: 1.0
+  beta: 1.0
+
+staleness_weight: exp
+staleness_lambda: 0.2
+# 固定 cutoff 不作为主控制；主阈值由 DynamicController 的 tau_max_t 与 server 侧 tau 覆盖决定。
+staleness_cutoff: -1
+
+dynamic_control:
+  enabled: true
+
+  tau_min: 2
+  tau_base: 8
+  tau_max_limit: 20
+
+  buffer_min: 2
+  buffer_base: 8
+  buffer_max: 16
+
+  delay_ref: 1.0
+  heter_ref: 1.0
+  staleness_ref: 8.0
+
+  tau_coeff_delay: 0.5
+  tau_coeff_heter: 0.5
+  tau_coeff_staleness: 0.8
+
+  buffer_coeff_delay: 0.5
+  buffer_coeff_heter: 0.5
+  buffer_coeff_staleness: 0.8
+
+eval_every: 2
+log_root: /home/kamila/SCAFL/logs/afl_async_base
+
+device: cpu
