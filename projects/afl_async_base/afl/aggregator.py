@@ -130,15 +130,49 @@ class Aggregator:
         self.buffer = kept
         return dropped
 
-    def _pairs_to_pending(self, pairs: List[Tuple[UpdateMsg, int]]) -> List[PendingUpdate]:
-        """将 (UpdateMsg, staleness) 列表转为 PendingUpdate（d_k 为占位定义）。"""
+    def refresh_and_prune_buffer(
+        self,
+        global_step: int,
+        tau_max_override: Optional[int] = None,
+    ) -> int:
+        """刷新陈旧度并按当前 tau 裁剪 buffer；incoming 被 server 丢弃时亦应调用。"""
+        self._refresh_buffer_staleness(global_step)
+        return int(self._prune_buffer_by_tau(tau_max_override))
+
+    def _filter_pairs_by_tau(
+        self, pairs: List[Tuple[UpdateMsg, int]], tau_max_override: Optional[int]
+    ) -> Tuple[List[Tuple[UpdateMsg, int]], int]:
+        kept: List[Tuple[UpdateMsg, int]] = []
+        dropped = 0
+        for m, s in pairs:
+            if self._accept(int(s), tau_max_override):
+                kept.append((m, int(s)))
+            else:
+                dropped += 1
+        return kept, dropped
+
+    def _pairs_to_pending(
+        self,
+        pairs: List[Tuple[UpdateMsg, int]],
+        incoming_msg: Optional[UpdateMsg] = None,
+    ) -> List[PendingUpdate]:
+        """
+        将 (UpdateMsg, staleness) 列表转为 PendingUpdate。
+
+        d_k 是 SC-AFL 中 d_k^t 的事件驱动工程近似：已在 server 侧 buffer 中的旧 update
+        视为本轮无需再等待其完成，故 d_k=0；仅对本轮 incoming update 使用
+        compute_time + upload_delay 作为其完成代价（与 compute_d_k 一致）。
+        """
         out: List[PendingUpdate] = []
         for m, s in pairs:
             ct = max(0.0, float(m.train_finished_at - m.train_started_at))
             ra = m.recv_at
             ud = max(0.0, float(ra - m.sent_at)) if ra is not None else 0.0
             arrival = float(ra) if ra is not None else 0.0
-            d_k = compute_d_k(ct, ud)
+            if incoming_msg is not None and m is incoming_msg:
+                d_k = compute_d_k(ct, ud)
+            else:
+                d_k = 0.0
             out.append(
                 PendingUpdate(
                     msg=m,
@@ -174,7 +208,7 @@ class Aggregator:
             (m, self._current_staleness(m, global_step)) for m, _s in self.buffer
         ]
         virtual = refreshed_buffer + [(msg, int(staleness))]
-        items = self._pairs_to_pending(virtual)
+        items = self._pairs_to_pending(virtual, incoming_msg=msg)
         return AggregationCandidateSet(
             items=items,
             source="buffer_plus_incoming",
@@ -182,14 +216,16 @@ class Aggregator:
             global_step=global_step,
         )
 
-    def _fallback_dynamic_threshold_after_append(
+    def _fallback_policy_from_virtual_pairs(
         self,
+        virtual_pairs: List[Tuple[UpdateMsg, int]],
         logical_round: int,
         global_step: int,
         target_size: int,
         tau_max_override: Optional[int],
     ) -> PolicyDecision:
-        items = self._pairs_to_pending(self.buffer)
+        inc = virtual_pairs[-1][0] if virtual_pairs else None
+        items = self._pairs_to_pending(virtual_pairs, incoming_msg=inc)
         cs = AggregationCandidateSet(
             items=items,
             source="buffer_plus_incoming",
@@ -224,7 +260,7 @@ class Aggregator:
                     applied=False,
                     accepted=False,
                     triggered_flush=False,
-                    flush_reason="drop_incoming_by_dynamic_tau",
+                    flush_reason="drop_incoming_by_tau",
                     flush_snapshot=None,
                 )
             w = max(self._weight(staleness), 0.05)
@@ -249,31 +285,30 @@ class Aggregator:
                 applied=False,
                 accepted=False,
                 triggered_flush=False,
-                flush_reason="drop_incoming_by_dynamic_tau",
+                flush_reason="drop_incoming_by_tau",
                 flush_snapshot=None,
                 remaining_buffer_count=len(self.buffer),
+                dropped_stale_count=0,
             )
 
-        dropped_old = self._prune_buffer_by_tau(tau_max_override)
-        if dropped_old > 0:
-            print(
-                f"[AGG] prune {dropped_old} stale buffered updates by tau_max_t={tau_max_override}"
-            )
-
-        self.buffer.append((msg, int(staleness)))
-
+        # 与 preview_aggregation_candidate_set 一致：旧 buffer（已刷新陈旧度）+ incoming；不得先 prune。
+        virtual_pairs: List[Tuple[UpdateMsg, int]] = list(self.buffer) + [
+            (msg, int(staleness))
+        ]
+        v_len = len(virtual_pairs)
         target_size = (
-            buffer_target_override
+            int(buffer_target_override)
             if buffer_target_override is not None
-            else self.buffer_size
+            else int(self.buffer_size)
         )
-        max_buffer_staleness = max(s for _, s in self.buffer) if self.buffer else 0
+        max_virtual_s = max(s for _, s in virtual_pairs) if virtual_pairs else 0
         print(
-            f"[AGG] buffer update {len(self.buffer)}/{target_size} max_staleness={max_buffer_staleness}"
+            f"[AGG] virtual buffer {v_len}/{target_size} max_staleness={max_virtual_s}"
         )
 
         if policy_decision is None:
-            policy_decision = self._fallback_dynamic_threshold_after_append(
+            policy_decision = self._fallback_policy_from_virtual_pairs(
+                virtual_pairs,
                 logical_round=logical_round,
                 global_step=global_step,
                 target_size=target_size,
@@ -281,29 +316,32 @@ class Aggregator:
             )
 
         if not policy_decision.should_flush:
+            kept, dropped = self._filter_pairs_by_tau(virtual_pairs, tau_max_override)
+            self.buffer = kept
             return StepResult(
                 applied=False,
                 accepted=True,
                 triggered_flush=False,
-                flush_reason=None,
+                flush_reason=policy_decision.reason or None,
                 flush_snapshot=None,
                 remaining_buffer_count=len(self.buffer),
-                dropped_stale_count=int(dropped_old),
+                dropped_stale_count=int(dropped),
+                selected_count=0,
+                flushed_count=0,
             )
 
-        buf_len = len(self.buffer)
         raw_sel = policy_decision.selected_indices
         if raw_sel is None or len(raw_sel) == 0:
-            selected_indices = list(range(buf_len))
+            selected_indices = list(range(v_len))
         else:
             selected_indices = list(raw_sel)
 
-        valid: Set[int] = set(range(buf_len))
+        valid: Set[int] = set(range(v_len))
         if not set(selected_indices).issubset(valid):
             print(
-                f"[AGG] invalid selected_indices, fallback to full buffer: {selected_indices!r}"
+                f"[AGG] invalid selected_indices, fallback to full virtual: {selected_indices!r}"
             )
-            selected_indices = list(range(buf_len))
+            selected_indices = list(range(v_len))
 
         # 去重保序（策略应给唯一索引；若重复则保留首次出现顺序）
         seen: Set[int] = set()
@@ -314,10 +352,10 @@ class Aggregator:
                 uniq.append(i)
         selected_indices = uniq
 
-        last_idx = buf_len - 1
+        last_idx = v_len - 1
         triggered_flush = last_idx in set(selected_indices)
 
-        selected_pairs = [self.buffer[i] for i in selected_indices]
+        selected_pairs = [virtual_pairs[i] for i in selected_indices]
         stalenesses = [int(s) for _, s in selected_pairs]
         n_u = len(stalenesses)
         computes: List[float] = []
@@ -359,9 +397,12 @@ class Aggregator:
         print("[AGG] apply buffered update (subset-capable)")
         state_dict_add_inplace(global_state, agg, self.server_lr)
 
-        for i in sorted(selected_indices, reverse=True):
-            del self.buffer[i]
-
+        sel_set = set(selected_indices)
+        unselected_pairs = [virtual_pairs[i] for i in range(v_len) if i not in sel_set]
+        kept_buf, dropped_u = self._filter_pairs_by_tau(
+            unselected_pairs, tau_max_override
+        )
+        self.buffer = kept_buf
         remaining = len(self.buffer)
         flush_reason = policy_decision.reason or None
 
@@ -375,5 +416,5 @@ class Aggregator:
             selected_count=n_u,
             remaining_buffer_count=remaining,
             policy_logical_round=logical_round,
-            dropped_stale_count=int(dropped_old),
+            dropped_stale_count=int(dropped_u),
         )

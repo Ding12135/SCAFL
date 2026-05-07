@@ -1,0 +1,32 @@
+# Buffered + fixed staleness threshold policy (dynamic_threshold) + heterogeneity
+seed: 2025
+num_clients: 5
+updates_per_client: 40
+dataset: MNIST
+data_dir: /home/kamila/SCAFL/data/raw
+non_iid: true
+num_shards: 20
+model: mlp
+batch_size: 128
+local_epochs: 1
+local_lr: 0.005
+momentum: 0.9
+weight_decay: 0.0001
+grad_clip: 5.0
+server_lr: 0.3
+async_mode: buffered
+buffer_size: 8
+policy:
+  type: dynamic_threshold
+staleness_weight: exp
+staleness_lambda: 0.2
+staleness_cutoff: 8
+dynamic_control:
+  enabled: false
+heterogeneity:
+  enabled: true
+  compute_delay_enabled: true
+  upload_delay_enabled: true
+eval_every: 5
+log_root: /home/kamila/SCAFL/logs/afl_async_base
+device: cuda

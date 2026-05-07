@@ -1,6 +1,7 @@
-seed: 42
-num_clients: 4
-updates_per_client: 24
+# 最小 CUDA 冒烟：2 客户端 × 2 轮更新，验证 GPU 路径可跑通
+seed: 1
+num_clients: 2
+updates_per_client: 2
 dataset: MNIST
 data_dir: /home/kamila/SCAFL/data/mnist_smoke
 non_iid: false
@@ -14,17 +15,16 @@ weight_decay: 0.0001
 grad_clip: 5.0
 server_lr: 0.3
 async_mode: buffered
-buffer_size: 99
+buffer_size: 4
+policy:
+  type: legacy
 staleness_weight: exp
 staleness_lambda: 0.2
-staleness_cutoff: 12
+staleness_cutoff: 8
 dynamic_control:
   enabled: false
-eval_every: 1
-log_root: /home/kamila/SCAFL/logs/policy_scafl_p2_smoke
+heterogeneity:
+  enabled: false
+eval_every: 10
+log_root: /home/kamila/SCAFL/logs/afl_cuda_smoke
 device: cuda
-policy:
-  type: scafl_p2
-  min_select_size: 4
-  max_select_size: 6
-  V: 1.0

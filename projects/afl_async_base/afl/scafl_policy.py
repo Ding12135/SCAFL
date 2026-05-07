@@ -44,6 +44,7 @@ def parse_policy_config(cfg: Any) -> Dict[str, Any]:
         "beta": float(raw.get("beta", 1.0)),
         "V": float(raw.get("V", 1.0)),
         "d_zero_eps": float(raw.get("d_zero_eps", 1e-12)),
+        "force_select_ready": bool(raw.get("force_select_ready", False)),
     }
 
 
@@ -95,6 +96,7 @@ def make_policy_from_config(cfg: Any) -> Tuple[object, Dict[str, Any]]:
                 min_select_size=int(pc["min_select_size"]),
                 max_select_size=int(pc["max_select_size"]),
                 V=float(pc["V"]),
+                force_select_ready=bool(pc.get("force_select_ready", False)),
             ),
             pc,
         )
@@ -130,6 +132,7 @@ def format_policy_params_for_log(pc: Dict[str, Any]) -> str:
         parts.append(f"min_select_size={pc.get('min_select_size', '')}")
         parts.append(f"max_select_size={pc.get('max_select_size', '')}")
         parts.append(f"V={pc.get('V', '')}")
+        parts.append(f"force_select_ready={pc.get('force_select_ready', '')}")
     if t == "dynamic_threshold":
         parts.append("threshold_buffer_baseline=1")
     return ";".join(parts)
@@ -317,7 +320,7 @@ class DynamicThresholdBufferPolicy:
             return PolicyDecision(
                 should_flush=False,
                 selected_indices=None,
-                selected_client_ids=None,
+                selected_client_ids=[],
                 tau_max=tau_max_override,
                 buffer_target=target_size,
                 reason="empty_buffer",
@@ -340,7 +343,7 @@ class DynamicThresholdBufferPolicy:
             return PolicyDecision(
                 should_flush=False,
                 selected_indices=None,
-                selected_client_ids=None,
+                selected_client_ids=[],
                 tau_max=tau_max_override,
                 buffer_target=target_size,
                 reason="not_triggered",
@@ -366,10 +369,14 @@ class DynamicThresholdBufferPolicy:
         else:
             reason = "dynamic_staleness_threshold"
 
+        selected_client_ids = sorted(
+            {int(items[i].client_id) for i in selected_indices}
+        )
+
         return PolicyDecision(
             should_flush=True,
             selected_indices=selected_indices,
-            selected_client_ids=[int(items[i].client_id) for i in selected_indices],
+            selected_client_ids=selected_client_ids,
             tau_max=tau_max_override,
             buffer_target=target_size,
             reason=reason,
@@ -823,26 +830,56 @@ class ApproxDriftPlusPenaltyPolicy:
 
 class SCAFLP2Policy:
     """
-    SC-AFL P2 对齐版策略（第一版，工程实现，不是论文严格复现版）。
+    SC-AFL-like baseline：固定 tau_max（由 tau_max_override / staleness_cutoff 提供），
+    在 P2-like 目标下按 d_k 排序并枚举 prefix 长度，选 objective 最小的子集聚合。
 
-    目标形式对齐论文 P2：
-      min over beta(t):
-        V * D_t + sum_k Q_k(t) * ((tau_k(t) + 1) * (1 - beta_k^t) - tau_max)
-
-    工程映射：
-    - Q_k(t): queue_by_client_id[client_id]（决策前 virtual_queue）
-    - tau_k(t): candidate_set 中该更新的 staleness
-    - beta_k^t: selected=1, unselected=0（仅对 candidate_set 定义）
-    - D_t: selected prefix 的 max(d_k)
-    - tau_max: 使用本轮 tau_max_override（若缺省则回退 target_size，仅作稳定回退）
-
-    搜索方式：先按 d_k 升序排序，仅枚举 prefix S_1..S_m（m=min(max_select_size,n)）。
+    objective(M_t) ≈ V * D_t + sum_k Q_k(t) * [ (tau_k(t)+1)*(1-beta_k(t)) - tau_max ]
     """
 
-    def __init__(self, min_select_size: int, max_select_size: int, V: float):
+    def __init__(
+        self,
+        min_select_size: int,
+        max_select_size: int,
+        V: float,
+        force_select_ready: bool = False,
+    ):
         self.min_select_size = int(min_select_size)
         self.max_select_size = int(max_select_size)
         self.V = float(V)
+        self.force_select_ready = bool(force_select_ready)
+
+    def _decision_records(
+        self,
+        items: List[PendingUpdate],
+        tau_used: int,
+        selected_idx: Optional[Set[int]],
+    ) -> List[CandidateDecisionRecord]:
+        recs: List[CandidateDecisionRecord] = []
+        for i, it in enumerate(items):
+            over = tau_used >= 0 and int(it.staleness) > tau_used
+            is_sel = selected_idx is not None and i in selected_idx
+            if is_sel:
+                dr = "selected"
+            elif over:
+                dr = "over_tau_max"
+            else:
+                dr = "unselected"
+            recs.append(
+                CandidateDecisionRecord(
+                    client_id=int(it.client_id),
+                    update_id=str(getattr(it, "update_id", "")),
+                    base_step=int(it.base_step),
+                    staleness=int(it.staleness),
+                    compute_time=float(it.compute_time),
+                    upload_delay=float(it.upload_delay),
+                    num_samples=int(it.num_samples),
+                    d_k=float(it.d_k),
+                    must_select=False,
+                    selected=is_sel,
+                    decision_reason=dr,
+                )
+            )
+        return recs
 
     def decide(
         self,
@@ -856,38 +893,123 @@ class SCAFLP2Policy:
         _ = system_state
         items = candidates.items
         n = len(items)
+        tau_used = int(tau_max_override) if tau_max_override is not None else int(target_size)
+
         if n == 0:
             return PolicyDecision(
                 should_flush=False,
                 selected_indices=None,
-                selected_client_ids=None,
+                selected_client_ids=[],
                 tau_max=tau_max_override,
                 buffer_target=target_size,
-                reason="empty_candidates",
+                reason="empty_candidate_set",
                 drop_unselected=False,
+                candidate_decisions=[],
             )
+
+        max_s = max(int(it.staleness) for it in items)
         if n < self.min_select_size:
+            force = (tau_used >= 0 and max_s >= tau_used) or (
+                self.force_select_ready and n >= 1
+            )
+            if not force:
+                return PolicyDecision(
+                    should_flush=False,
+                    selected_indices=None,
+                    selected_client_ids=[],
+                    tau_max=tau_max_override,
+                    buffer_target=target_size,
+                    reason="not_enough_candidates",
+                    drop_unselected=False,
+                    candidate_decisions=self._decision_records(items, tau_used, None),
+                )
+            pick = min(
+                range(n),
+                key=lambda i: (
+                    int(items[i].staleness),
+                    float(items[i].d_k),
+                    int(items[i].client_id),
+                    i,
+                ),
+            )
+            sel = [pick]
+            sel_set = {pick}
+            obj, D_t, term_sum, _ = compute_scafl_p2_objective_for_prefix(
+                items=items,
+                sorted_prefix_indices=sel,
+                queue_by_client_id=queue_by_client_id,
+                tau_max_used=tau_used,
+                V=self.V,
+            )
+            cand_c = {int(it.client_id) for it in items}
+            sel_c = {int(items[pick].client_id)}
+            b1 = len(sel_c)
+            b0 = max(len(cand_c) - b1, 0)
+            pfx = PrefixEvaluationRecord(
+                prefix_size=1,
+                candidate_count=int(n),
+                selected_indices=[int(pick)],
+                selected_client_ids=[int(items[pick].client_id)],
+                unselected_client_ids=[
+                    int(items[i].client_id) for i in range(n) if i != pick
+                ],
+                D_t=float(D_t),
+                tau_max_used=int(tau_used),
+                candidate_term_sum=float(term_sum),
+                objective_value=float(obj),
+                beta_ones=int(b1),
+                beta_zeros=int(b0),
+                selected_dks=[float(items[pick].d_k)],
+                selected_qs=[
+                    float(queue_by_client_id.get(int(items[pick].client_id), 0.0))
+                    if queue_by_client_id
+                    else 0.0
+                ],
+                selected_taus=[int(items[pick].staleness)],
+                unselected_qs=[
+                    float(queue_by_client_id.get(int(items[i].client_id), 0.0))
+                    if queue_by_client_id
+                    else 0.0
+                    for i in range(n)
+                    if i != pick
+                ],
+                unselected_taus=[int(items[i].staleness) for i in range(n) if i != pick],
+            )
             return PolicyDecision(
-                should_flush=False,
-                selected_indices=None,
-                selected_client_ids=None,
+                should_flush=True,
+                selected_indices=sel,
+                selected_client_ids=sorted({int(items[pick].client_id)}),
                 tau_max=tau_max_override,
                 buffer_target=target_size,
-                reason="below_min_select",
+                reason="scafl_p2_forced_pressure",
                 drop_unselected=False,
+                objective_value=float(obj),
+                time_term=float(D_t),
+                queue_term=float(term_sum),
+                selected_prefix_size=1,
+                evaluated_prefix_count=1,
+                prefix_evaluations=[pfx],
+                candidate_decisions=self._decision_records(items, tau_used, sel_set),
             )
 
-        ranked = sorted(range(n), key=lambda i: (float(items[i].d_k), i))
-        m_max = min(self.max_select_size, n)
-        tau_used = int(tau_max_override) if tau_max_override is not None else int(target_size)
+        ranked = sorted(
+            range(n), key=lambda i: (float(items[i].d_k), int(items[i].client_id), i)
+        )
+        m_lo = max(1, int(self.min_select_size))
+        m_hi = min(int(self.max_select_size), n)
+        if m_lo > m_hi:
+            m_lo = min(m_lo, n)
+            m_hi = max(m_hi, m_lo)
 
-        best_j = 1
+        best_j = m_lo
         best_obj = float("inf")
         best_D = 0.0
         best_term = 0.0
         prefix_records: List[PrefixEvaluationRecord] = []
+        evaluated = 0
 
-        for j in range(1, m_max + 1):
+        for j in range(m_lo, m_hi + 1):
+            evaluated += 1
             sel = ranked[:j]
             obj, D_t, term_sum, _ = compute_scafl_p2_objective_for_prefix(
                 items=items,
@@ -915,6 +1037,10 @@ class SCAFLP2Policy:
                 if i not in sel_set
             ]
             unsel_taus = [int(items[i].staleness) for i in range(n) if i not in sel_set]
+            cand_clients = set(int(it.client_id) for it in items)
+            sel_clients = set(int(items[i].client_id) for i in sel)
+            beta_ones = len(sel_clients)
+            beta_zeros = max(len(cand_clients) - beta_ones, 0)
             prefix_records.append(
                 PrefixEvaluationRecord(
                     prefix_size=int(j),
@@ -926,8 +1052,8 @@ class SCAFLP2Policy:
                     tau_max_used=int(tau_used),
                     candidate_term_sum=float(term_sum),
                     objective_value=float(obj),
-                    beta_ones=int(len(sel)),
-                    beta_zeros=int(n - len(sel)),
+                    beta_ones=int(beta_ones),
+                    beta_zeros=int(beta_zeros),
                     selected_dks=sel_dks,
                     selected_qs=sel_qs,
                     selected_taus=sel_taus,
@@ -942,18 +1068,20 @@ class SCAFLP2Policy:
                 best_term = term_sum
 
         selected_indices = ranked[:best_j]
+        sel_set = set(selected_indices)
         return PolicyDecision(
             should_flush=True,
             selected_indices=selected_indices,
-            selected_client_ids=[items[i].client_id for i in selected_indices],
+            selected_client_ids=sorted({int(items[i].client_id) for i in selected_indices}),
             tau_max=tau_max_override,
             buffer_target=target_size,
-            reason="scafl_p2_prefix",
+            reason="scafl_p2_min_objective",
             drop_unselected=False,
             objective_value=float(best_obj),
             time_term=float(best_D),
             queue_term=float(best_term),
             selected_prefix_size=int(best_j),
-            evaluated_prefix_count=int(m_max),
+            evaluated_prefix_count=int(evaluated),
             prefix_evaluations=prefix_records,
+            candidate_decisions=self._decision_records(items, tau_used, sel_set),
         )

@@ -1,0 +1,53 @@
+# SC-AFL-like baseline：固定 tau_max（staleness_cutoff）+ 虚拟队列 + P2-like 子集选择；异构仅模拟时延。
+seed: 2025
+
+num_clients: 3
+updates_per_client: 12
+
+dataset: MNIST
+data_dir: /home/kamila/SCAFL/data/raw
+non_iid: true
+num_shards: 20
+
+model: mlp
+batch_size: 128
+local_epochs: 1
+local_lr: 0.005
+momentum: 0.9
+weight_decay: 0.0001
+grad_clip: 5.0
+
+server_lr: 0.3
+
+async_mode: buffered
+buffer_size: 8
+
+staleness_weight: exp
+staleness_lambda: 0.2
+staleness_cutoff: 8
+
+dynamic_control:
+  enabled: false
+
+policy:
+  type: scafl_p2
+  V: 10.0
+  min_select_size: 1
+  max_select_size: 8
+  force_select_ready: true
+
+heterogeneity:
+  enabled: true
+  profile: moderate
+  seed: 2025
+  compute_delay_enabled: true
+  upload_delay_enabled: true
+
+logging:
+  save_decision_debug: true
+  save_queue_trace: true
+  save_round_metrics: true
+
+eval_every: 5
+log_root: /home/kamila/SCAFL/logs/afl_async_base
+device: cuda

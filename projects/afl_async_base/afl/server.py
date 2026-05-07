@@ -3,11 +3,12 @@ import csv
 import json
 import os
 import queue
+import time
 import sys
 import yaml
 import torch
 import torch.multiprocessing as mp
-from typing import Any, Dict, List, Optional, Set, TextIO
+from typing import Any, Dict, List, Optional, Set, TextIO, Tuple
 
 from .model import build_model
 from .data import make_client_loaders
@@ -419,17 +420,27 @@ def evaluate(model, test_loader, device: str):
 
 def client_proc(client_id: int, shared, lock, recv_q, cfg):
     from .client import train_one_client
+    from .hetero_simulator import (
+        hetero_enabled,
+        simulate_compute_delay,
+        simulate_upload_delay,
+    )
 
     model_builder = lambda: build_model(cfg["model"])
     loader = shared["client_loaders"][client_id]
     device = cfg["device"]
+    het_on = hetero_enabled(cfg)
 
-    for _ in range(cfg["updates_per_client"]):
+    for update_idx in range(cfg["updates_per_client"]):
         with lock:
             base_step = int(shared["global_step"])
             base_state = copy.deepcopy(shared["global_state"])
 
-        delta, num_samples, local_epochs, train_started_at, train_finished_at, sent_at, train_loss = train_one_client(
+        compute_extra = simulate_compute_delay(client_id, update_idx, cfg) if het_on else 0.0
+        if compute_extra > 0:
+            time.sleep(compute_extra)
+
+        delta, num_samples, local_epochs, train_started_at, train_finished_at, _sent_old, train_loss = train_one_client(
             client_id=client_id,
             base_state=base_state,
             loader=loader,
@@ -440,8 +451,13 @@ def client_proc(client_id: int, shared, lock, recv_q, cfg):
             momentum=cfg.get("momentum", 0.9),
             weight_decay=cfg.get("weight_decay", 1e-4),
             grad_clip=cfg.get("grad_clip", 5.0),
-            simulate_hetero=True,
+            simulate_hetero=not het_on,
         )
+
+        upload_delay_sim = simulate_upload_delay(client_id, update_idx, cfg) if het_on else 0.0
+        upload_sent_at = now_s()
+        if upload_delay_sim > 0:
+            time.sleep(upload_delay_sim)
 
         msg = UpdateMsg(
             client_id=client_id,
@@ -451,7 +467,7 @@ def client_proc(client_id: int, shared, lock, recv_q, cfg):
             local_epochs=local_epochs,
             train_started_at=train_started_at,
             train_finished_at=train_finished_at,
-            sent_at=sent_at,
+            sent_at=upload_sent_at,
             train_loss=train_loss,
         )
         recv_q.put(msg)
@@ -790,6 +806,10 @@ def main():
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
+    env_seed = os.environ.get("AFL_SEED", "").strip()
+    if env_seed:
+        cfg["seed"] = int(env_seed)
+
     set_seed(cfg["seed"])
     run_dir = make_run_dir(cfg["log_root"])
 
@@ -847,6 +867,7 @@ def main():
             for cid in range(cfg["num_clients"])
         }
 
+        # 保留占位：collect_system_state(immediate) 仍可用；buffered baseline 以 agg.buffer 为准。
         metadata_buffer: List[BufferedUpdate] = []
 
         manager = mp.Manager()
@@ -961,18 +982,6 @@ def main():
             compute_time_sum += compute_time
             upload_delay_sum += upload_delay
 
-            bu = BufferedUpdate(
-                client_id=msg.client_id,
-                base_step=int(msg.base_step),
-                arrival_step=int(gs_before),
-                staleness=int(staleness),
-                num_samples=num_samples,
-                train_loss=msg.train_loss,
-                compute_time=compute_time,
-                upload_delay=upload_delay,
-                delta=msg.delta,
-            )
-
             cs = client_states[msg.client_id]
             cs.last_base_step = int(msg.base_step)
             cs.last_recv_step = int(gs_before)
@@ -982,7 +991,7 @@ def main():
 
             if cfg["async_mode"] == "buffered":
                 msg.update_id = (
-                    f"c{int(msg.client_id)}_b{int(msg.base_step)}_r{int(completed_flush_rounds)}"
+                    f"u{int(recv_step)}_c{int(msg.client_id)}_b{int(msg.base_step)}_r{int(completed_flush_rounds)}"
                 )
                 msg.entered_buffer_round = int(completed_flush_rounds)
             else:
@@ -1014,27 +1023,49 @@ def main():
             )
 
             ctrl = controller.compute(system_state)
-            print(
-                f"[CONTROL] tau_max_t={ctrl.tau_max_t} buffer_target_t={ctrl.buffer_target_t} "
-                f"delay_score={ctrl.delay_score:.6f} heter_score={ctrl.heter_score:.6f} "
-                f"staleness_score={ctrl.staleness_score:.6f}"
-            )
 
             buffer_target_override: Optional[int] = None
             tau_max_override: Optional[int] = None
+            dc_enabled = bool(controller.enabled)
             if cfg["async_mode"] == "buffered":
-                if not controller.enabled:
+                if not dc_enabled:
                     tau_max_override = int(cfg.get("staleness_cutoff", -1))
                     buffer_target_override = int(cfg.get("buffer_size", 8))
+                    if str(policy_cfg.get("type", "")).lower() == "scafl_p2":
+                        buffer_target_override = max(
+                            buffer_target_override,
+                            int(policy_cfg.get("max_select_size", buffer_target_override)),
+                        )
                 else:
                     tau_max_override = int(ctrl.tau_max_t)
                     buffer_target_override = int(ctrl.buffer_target_t)
             else:
-                if not controller.enabled:
+                if not dc_enabled:
                     tau_max_override = int(cfg.get("staleness_cutoff", -1))
                 else:
                     tau_max_override = int(ctrl.tau_max_t)
 
+            tau_used = (
+                int(tau_max_override)
+                if tau_max_override is not None
+                else int(ctrl.tau_max_t)
+            )
+            buffer_target_used = (
+                int(buffer_target_override)
+                if buffer_target_override is not None
+                else int(ctrl.buffer_target_t)
+            )
+            if cfg["async_mode"] == "buffered" and not dc_enabled:
+                tau_used = int(cfg.get("staleness_cutoff", tau_used))
+
+            print(
+                f"[CONTROL] tau_max_t={tau_used} buffer_target_t={buffer_target_used} "
+                f"(ctrl_raw_tau={ctrl.tau_max_t} ctrl_raw_buf={ctrl.buffer_target_t}) "
+                f"delay_score={ctrl.delay_score:.6f} heter_score={ctrl.heter_score:.6f} "
+                f"staleness_score={ctrl.staleness_score:.6f}"
+            )
+
+            # 计算每个client的虚拟队列长度
             queue_by_client_id: Dict[int, float] = {
                 int(cid): float(cs.virtual_queue) for cid, cs in client_states.items()
             }
@@ -1051,17 +1082,20 @@ def main():
                     )
                 else:
                     assert candidate_set is not None
-                    target_sz = (
-                        int(buffer_target_override)
-                        if buffer_target_override is not None
-                        else int(agg.buffer_size)
-                    )
                     policy_decision = train_policy.decide(
                         candidate_set,
                         system_state,
-                        target_size=target_sz,
+                        target_size=int(buffer_target_used),
                         tau_max_override=tau_max_override,
                         queue_by_client_id=queue_by_client_id,
+                    )
+                    print(
+                        f"[DECISION] policy={policy_cfg['type']} tau_used={tau_used} "
+                        f"buffer_target_used={buffer_target_used} "
+                        f"candidate_count={last_candidate_count} "
+                        f"should_flush={int(policy_decision.should_flush)} "
+                        f"reason={policy_decision.reason!r} "
+                        f"sel_n={len(policy_decision.selected_indices or [])}"
                     )
 
             with lock:
@@ -1069,19 +1103,28 @@ def main():
                 max_staleness_agg_before = max((s for _, s in agg.buffer), default=0)
 
                 if cfg["async_mode"] == "buffered" and not accepted_by_server_tau:
+                    dropped_old = agg.refresh_and_prune_buffer(
+                        global_step=gs_before,
+                        tau_max_override=tau_max_override,
+                    )
+                    buffer_len_after = len(agg.buffer)
+                    max_staleness_agg_after = max(
+                        (s for _, s in agg.buffer), default=0
+                    )
                     step_result = StepResult(
                         applied=False,
                         accepted=False,
                         triggered_flush=False,
-                        flush_reason="server_drop_incoming_by_dynamic_tau",
+                        flush_reason="drop_incoming_by_tau",
                         flush_snapshot=None,
-                        remaining_buffer_count=buffer_len_before,
+                        selected_count=0,
+                        flushed_count=0,
+                        remaining_buffer_count=buffer_len_after,
+                        dropped_stale_count=int(dropped_old),
                     )
                     applied = False
                     accepted = False
                     triggered_flush = False
-                    buffer_len_after = buffer_len_before
-                    max_staleness_agg_after = max_staleness_agg_before
                     global_step_after = int(shared["global_step"])
                 else:
                     step_result = agg.step(
@@ -1119,12 +1162,13 @@ def main():
             flush_reason_str = step_result.flush_reason if step_result.flush_reason else ""
 
             if cfg["async_mode"] == "buffered":
-                target_sz = int(buffer_target_override) if buffer_target_override is not None else int(agg.buffer_size)
                 print(
                     f"[BUFFER] buffer_len_before={buffer_len_before} buffer_len_after={buffer_len_after} "
-                    f"target_buffer_size={target_sz} max_staleness_before={max_staleness_agg_before} "
+                    f"target_buffer_size={buffer_target_used} max_staleness_before={max_staleness_agg_before} "
                     f"max_staleness_after={max_staleness_agg_after} applied={int(applied)} "
-                    f"triggered_flush={int(triggered_flush)} flush_reason={flush_reason_str!r}"
+                    f"triggered_flush={int(triggered_flush)} flush_reason={flush_reason_str!r} "
+                    f"remaining_buffer_count={step_result.remaining_buffer_count} "
+                    f"dropped_stale_count={step_result.dropped_stale_count}"
                 )
             else:
                 print(
@@ -1133,14 +1177,8 @@ def main():
                     f"flush_reason={flush_reason_str!r}"
                 )
 
-            if cfg["async_mode"] == "buffered":
-                if applied:
-                    metadata_buffer.clear()
-                else:
-                    if buffer_len_after > buffer_len_before:
-                        metadata_buffer.append(bu)
-
-            metadata_buffer_len = len(metadata_buffer)
+            # metadata_buffer 已废弃作为正式统计；指标列 metadata_buffer_len 与 agg.buffer 对齐。
+            metadata_buffer_len = len(agg.buffer)
 
             if (
                 cfg["async_mode"] == "buffered"
@@ -1164,12 +1202,8 @@ def main():
                             snap.avg_compute_time,
                             snap.avg_upload_delay,
                             snap.total_samples,
-                            int(buffer_target_override)
-                            if buffer_target_override is not None
-                            else int(ctrl.buffer_target_t),
-                            int(tau_max_override)
-                            if tau_max_override is not None
-                            else int(ctrl.tau_max_t),
+                            buffer_target_used,
+                            tau_used,
                         ]
                     )
 
@@ -1226,7 +1260,7 @@ def main():
                         candidate_set=candidate_set,
                         selected_indices=policy_decision.selected_indices,
                         client_states=client_states,
-                        tau_max_t=int(ctrl.tau_max_t),
+                        tau_max_t=int(tau_used),
                         policy_type=policy_cfg["type"],
                     )
                     if queue_extras["trace_rows"]:
@@ -1261,7 +1295,6 @@ def main():
                     eval_prefix_cnt = sel_prefix_sz = 0
                     cand_q_sum = unsel_q_sum = 0.0
                 if candidate_set is not None and policy_decision is not None:
-                    tau_used_rm = int(ctrl.tau_max_t)
                     (
                         sel_obj_p2,
                         sel_D_t,
@@ -1273,7 +1306,7 @@ def main():
                         candidate_set,
                         policy_decision,
                         queue_by_client_id,
-                        tau_used_rm,
+                        int(tau_used),
                         float(policy_cfg.get("V", 1.0)),
                     )
                     dbg_rows = _decision_debug_rows_for_round(
@@ -1281,7 +1314,7 @@ def main():
                         candidate_set=candidate_set,
                         selected_indices=list(policy_decision.selected_indices or []),
                         queue_by_client_id=queue_by_client_id,
-                        tau_max_used=tau_used_rm,
+                        tau_max_used=int(tau_used),
                         policy_type=str(policy_cfg["type"]),
                         policy_decision=policy_decision,
                     )
@@ -1323,7 +1356,7 @@ def main():
                                 )
                 else:
                     sel_obj_p2 = sel_D_t = cand_term_sum = 0.0
-                    sel_tau_max_used = int(ctrl.tau_max_t)
+                    sel_tau_max_used = int(tau_used)
                     beta_ones = beta_zeros = 0
                 selected_client_count_rm = 0
                 unselected_client_count_rm = 0
@@ -1459,17 +1492,6 @@ def main():
 
             wall_time = now_s() - start_t
 
-            log_buf_t = (
-                int(buffer_target_override)
-                if buffer_target_override is not None
-                else int(ctrl.buffer_target_t)
-            )
-            log_tau_t = (
-                int(tau_max_override)
-                if tau_max_override is not None
-                else int(ctrl.tau_max_t)
-            )
-
             with open(metrics_path, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(
                     [
@@ -1487,8 +1509,8 @@ def main():
                         buffer_len_before,
                         buffer_len_after,
                         metadata_buffer_len,
-                        log_buf_t,
-                        log_tau_t,
+                        buffer_target_used,
+                        tau_used,
                         ctrl.delay_score,
                         ctrl.heter_score,
                         ctrl.staleness_score,
