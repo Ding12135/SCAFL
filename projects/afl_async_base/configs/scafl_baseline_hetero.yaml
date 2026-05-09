@@ -1,8 +1,11 @@
 # SC-AFL-like baseline：固定 tau_max（staleness_cutoff）+ 虚拟队列 + P2-like 子集选择；异构仅模拟时延。
+#
+# 相对「最小 smoke」的加强设定：便于实验中更常出现「缓冲内多条候选」「n>=min_select_size 下的
+# 多前缀 P2 枚举」，以及在有未入选候选时让 virtual queue 有机会非零；训练使用 GPU（device: cuda）。
 seed: 2025
 
-num_clients: 3
-updates_per_client: 12
+num_clients: 6
+updates_per_client: 40
 
 dataset: MNIST
 data_dir: /home/kamila/SCAFL/data/raw
@@ -20,11 +23,12 @@ grad_clip: 5.0
 server_lr: 0.3
 
 async_mode: buffered
-buffer_size: 8
+buffer_size: 16
 
 staleness_weight: exp
 staleness_lambda: 0.2
-staleness_cutoff: 8
+# 略放宽 τ，减少「单条即触顶被迫 flush」、利于多条同时在候选中再决策
+staleness_cutoff: 12
 
 dynamic_control:
   enabled: false
@@ -32,9 +36,11 @@ dynamic_control:
 policy:
   type: scafl_p2
   V: 10.0
-  min_select_size: 1
-  max_select_size: 8
-  force_select_ready: true
+  # 至少 2 条候选才走完整 P2 前缀枚举；避免 n=1 时仅靠 force 单条 flush
+  min_select_size: 2
+  max_select_size: 12
+  # 关闭：否则 n < min_select_size 时仍会对单条 incoming 强制 flush，弱化多候选与 buffer 形态
+  force_select_ready: false
 
 heterogeneity:
   enabled: true

@@ -1,0 +1,12 @@
+# Experiment outputs — do not commit (regenerate with local runs)
+runs/
+results/
+logs/
+
+# Local dataset cache under this project (e.g. MNIST in ./data)
+data/
+
+# Python tooling noise
+.pytest_cache/
+.coverage
+htmlcov/

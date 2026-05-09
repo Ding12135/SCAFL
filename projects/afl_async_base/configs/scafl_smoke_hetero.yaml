@@ -1,0 +1,65 @@
+# SC-AFL P2 + 异构时延 smoke：验证 global_state 写回、compute/upload 语义、client-level P2 queue 项。
+# 运行（在 projects/afl_async_base 下）:
+#   export PYTHONPATH=.
+#   AFL_CONFIG=configs/scafl_smoke_hetero.yaml python -m afl.server
+
+seed: 2025
+device: cpu
+log_root: runs
+
+dataset: MNIST
+data_dir: data
+model: cnn
+num_clients: 5
+updates_per_client: 5
+local_epochs: 1
+local_lr: 0.01
+batch_size: 32
+momentum: 0.9
+weight_decay: 0.0001
+grad_clip: 5.0
+
+non_iid: true
+num_shards: 10
+
+server_lr: 1.0
+async_mode: buffered
+buffer_size: 3
+staleness_cutoff: 4
+staleness_weight: exp
+staleness_lambda: 0.2
+
+eval_every: 1
+
+dynamic_control:
+  enabled: false
+  tau_min: 1
+  tau_base: 8
+  tau_max_limit: 32
+  buffer_min: 1
+  buffer_base: 8
+  buffer_max: 32
+  delay_ref: 1.0
+  heter_ref: 1.0
+  staleness_ref: 1.0
+  tau_coeff_delay: 0.5
+  tau_coeff_heter: 0.5
+  tau_coeff_staleness: 0.5
+  buffer_coeff_delay: 0.5
+  buffer_coeff_heter: 0.5
+  buffer_coeff_staleness: 0.5
+
+policy:
+  type: scafl_p2
+  V: 10.0
+  min_select_size: 1
+  max_select_size: 3
+  force_select_ready: true
+  select_size: 3
+
+heterogeneity:
+  enabled: true
+  profile: moderate
+  seed: 2025
+  compute_delay_enabled: true
+  upload_delay_enabled: true

@@ -1,0 +1,40 @@
+# EMNIST Balanced（47 类）+ MLP 冒烟；联邦文献中常见 EMNIST 设定
+seed: 1
+num_clients: 2
+updates_per_client: 3
+
+dataset: EMNIST
+data_dir: ./data/raw
+
+non_iid: true
+num_shards: 40
+
+model: mlp
+batch_size: 128
+local_epochs: 1
+local_lr: 0.01
+momentum: 0.9
+weight_decay: 0.0001
+grad_clip: 5.0
+
+server_lr: 0.3
+async_mode: buffered
+buffer_size: 2
+
+policy:
+  type: legacy
+  min_select_size: 1
+  select_size: 2
+  max_select_size: 2
+  V: 1.0
+
+staleness_weight: exp
+staleness_lambda: 0.2
+staleness_cutoff: 8
+
+dynamic_control:
+  enabled: false
+
+eval_every: 1
+log_root: ./logs/afl_async_base
+device: cpu

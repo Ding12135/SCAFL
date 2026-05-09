@@ -11,6 +11,7 @@ venv/
 # Data & experiment outputs (regenerate locally)
 data/
 logs/
+runs/
 
 # Local tooling / installers — never version-control
 software/
@@ -20,3 +21,7 @@ software/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local notes (do not push to remote)
+论文实验进展记录.txt
+说明.txt

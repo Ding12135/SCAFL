@@ -29,6 +29,14 @@ def compute_d_k(compute_time: float, upload_delay: float) -> float:
     return max(0.0, float(compute_time)) + max(0.0, float(upload_delay))
 
 
+def _sorted_unique_client_ids_from_indices(
+    items: List[PendingUpdate], indices: List[int]
+) -> List[int]:
+    """update-level 下标列表 -> 去重后的 client_id 列表（升序）。"""
+    n = len(items)
+    return sorted({int(items[i].client_id) for i in indices if 0 <= i < n})
+
+
 def parse_policy_config(cfg: Any) -> Dict[str, Any]:
     """从顶层 yaml 读取 policy 段；缺省为 legacy。"""
     raw = cfg.get("policy") if isinstance(cfg, dict) else None
@@ -162,23 +170,30 @@ def compute_scafl_p2_objective_for_prefix(
     n = len(items)
     if n == 0:
         return 0.0, 0.0, 0.0, 0.0
-    sel = set(sorted_prefix_indices)
-    D_t = max(float(items[i].d_k) for i in sorted_prefix_indices) if sorted_prefix_indices else 0.0
-    candidate_clients: Set[int] = set(int(it.client_id) for it in items)
-    selected_clients: Set[int] = set(
-        int(items[i].client_id) for i in sorted_prefix_indices if 0 <= i < n
+    D_t = (
+        max(float(items[i].d_k) for i in sorted_prefix_indices)
+        if sorted_prefix_indices
+        else 0.0
     )
+    # Q_k 与 beta_k 均为 client-level；候选可为同一 client 多条 update，队列项只计一次。
+    candidate_clients = sorted({int(it.client_id) for it in items})
+    selected_clients: Set[int] = {
+        int(items[i].client_id) for i in sorted_prefix_indices if 0 <= i < n
+    }
     term_sum = 0.0
     unselected_term_sum = 0.0
     tau_m = int(tau_max_used)
     for cid in candidate_clients:
-        q_i = float(queue_by_client_id.get(cid, 0.0)) if queue_by_client_id else 0.0
-        beta_i = 1 if cid in selected_clients else 0
-        tau_i = max(int(it.staleness) for it in items if int(it.client_id) == cid)
-        term_i = q_i * (((tau_i + 1) * (1 - beta_i)) - tau_m)
-        term_sum += term_i
-        if beta_i == 0:
-            unselected_term_sum += term_i
+        client_items = [it for it in items if int(it.client_id) == cid]
+        q_k = (
+            float(queue_by_client_id.get(cid, 0.0)) if queue_by_client_id else 0.0
+        )
+        beta_k = 1 if cid in selected_clients else 0
+        tau_k_use = max(int(it.staleness) for it in client_items)
+        term_k = q_k * (((tau_k_use + 1) * (1 - beta_k)) - tau_m)
+        term_sum += term_k
+        if beta_k == 0:
+            unselected_term_sum += term_k
     obj = float(V) * D_t + term_sum
     return obj, D_t, term_sum, unselected_term_sum
 
@@ -476,8 +491,9 @@ class SCAFLPolicy:
                 V=self.V,
             )
             sel_set = set(sel)
-            sel_ids = [int(items[i].client_id) for i in sel]
-            unsel_ids = [int(items[i].client_id) for i in range(n) if i not in sel_set]
+            all_candidate_cids = sorted({int(it.client_id) for it in items})
+            sel_cids = _sorted_unique_client_ids_from_indices(items, sel)
+            unsel_cids = sorted(set(all_candidate_cids) - set(sel_cids))
             sel_dks = [float(items[i].d_k) for i in sel]
             sel_qs = [
                 float(queue_by_client_id.get(int(items[i].client_id), 0.0))
@@ -494,15 +510,15 @@ class SCAFLPolicy:
                 if i not in sel_set
             ]
             unsel_taus = [int(items[i].staleness) for i in range(n) if i not in sel_set]
-            beta_ones = len(set(sel_ids))
-            beta_zeros = len(set(int(it.client_id) for it in items)) - beta_ones
+            beta_ones = len(sel_cids)
+            beta_zeros = max(len(all_candidate_cids) - beta_ones, 0)
             prefix_records.append(
                 PrefixEvaluationRecord(
                     prefix_size=int(j),
                     candidate_count=int(n),
                     selected_indices=[int(x) for x in sel],
-                    selected_client_ids=sel_ids,
-                    unselected_client_ids=unsel_ids,
+                    selected_client_ids=sel_cids,
+                    unselected_client_ids=unsel_cids,
                     D_t=float(D_t),
                     tau_max_used=int(tau_used),
                     candidate_term_sum=float(term_sum),
@@ -551,7 +567,9 @@ class SCAFLPolicy:
         return PolicyDecision(
             should_flush=True,
             selected_indices=selected,
-            selected_client_ids=[int(items[i].client_id) for i in selected],
+            selected_client_ids=sorted(
+                {int(items[i].client_id) for i in selected}
+            ),
             tau_max=tau_max_override,
             buffer_target=target_size,
             reason="scafl_p2_prefix_subset",
@@ -908,6 +926,28 @@ class SCAFLP2Policy:
             )
 
         max_s = max(int(it.staleness) for it in items)
+        # 与 LegacyFullBufferPolicy 对齐的 buffered 触发：先积累 virtual_pairs（旧 buffer + incoming），
+        # 再在本候选集上做 P2 子集决策；否则 min_select_size=1 会在每条消息上立刻 flush，候选数恒为 1。
+        target_t = int(target_size) if target_size is not None else n
+        size_trigger = n >= target_t
+        staleness_trigger = (
+            tau_max_override is not None
+            and int(tau_max_override) >= 0
+            and max_s >= int(tau_max_override)
+        )
+        ready_force = self.force_select_ready and n >= self.min_select_size
+        if not (size_trigger or staleness_trigger or ready_force):
+            return PolicyDecision(
+                should_flush=False,
+                selected_indices=None,
+                selected_client_ids=[],
+                tau_max=tau_max_override,
+                buffer_target=target_size,
+                reason="no_trigger",
+                drop_unselected=False,
+                candidate_decisions=self._decision_records(items, tau_used, None),
+            )
+
         if n < self.min_select_size:
             force = (tau_used >= 0 and max_s >= tau_used) or (
                 self.force_select_ready and n >= 1
@@ -945,14 +985,13 @@ class SCAFLP2Policy:
             sel_c = {int(items[pick].client_id)}
             b1 = len(sel_c)
             b0 = max(len(cand_c) - b1, 0)
+            pick_cid = int(items[pick].client_id)
             pfx = PrefixEvaluationRecord(
                 prefix_size=1,
                 candidate_count=int(n),
                 selected_indices=[int(pick)],
-                selected_client_ids=[int(items[pick].client_id)],
-                unselected_client_ids=[
-                    int(items[i].client_id) for i in range(n) if i != pick
-                ],
+                selected_client_ids=[pick_cid],
+                unselected_client_ids=sorted(c for c in cand_c if c != pick_cid),
                 D_t=float(D_t),
                 tau_max_used=int(tau_used),
                 candidate_term_sum=float(term_sum),
@@ -1019,8 +1058,9 @@ class SCAFLP2Policy:
                 V=self.V,
             )
             sel_set = set(sel)
-            sel_ids = [int(items[i].client_id) for i in sel]
-            unsel_ids = [int(items[i].client_id) for i in range(n) if i not in sel_set]
+            all_cand_cids = sorted({int(it.client_id) for it in items})
+            sel_cids = _sorted_unique_client_ids_from_indices(items, sel)
+            unsel_cids = sorted(set(all_cand_cids) - set(sel_cids))
             sel_dks = [float(items[i].d_k) for i in sel]
             sel_qs = [
                 float(queue_by_client_id.get(int(items[i].client_id), 0.0))
@@ -1037,17 +1077,15 @@ class SCAFLP2Policy:
                 if i not in sel_set
             ]
             unsel_taus = [int(items[i].staleness) for i in range(n) if i not in sel_set]
-            cand_clients = set(int(it.client_id) for it in items)
-            sel_clients = set(int(items[i].client_id) for i in sel)
-            beta_ones = len(sel_clients)
-            beta_zeros = max(len(cand_clients) - beta_ones, 0)
+            beta_ones = len(sel_cids)
+            beta_zeros = max(len(all_cand_cids) - beta_ones, 0)
             prefix_records.append(
                 PrefixEvaluationRecord(
                     prefix_size=int(j),
                     candidate_count=int(n),
                     selected_indices=[int(x) for x in sel],
-                    selected_client_ids=sel_ids,
-                    unselected_client_ids=unsel_ids,
+                    selected_client_ids=sel_cids,
+                    unselected_client_ids=unsel_cids,
                     D_t=float(D_t),
                     tau_max_used=int(tau_used),
                     candidate_term_sum=float(term_sum),

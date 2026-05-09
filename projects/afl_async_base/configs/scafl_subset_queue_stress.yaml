@@ -1,0 +1,66 @@
+# Stress smoke：SC-AFL-like baseline（固定 tau_max + 虚拟队列 + P2 子集 + buffer carry-over）。
+# 在 projects/afl_async_base 下运行:
+#   export PYTHONPATH=.
+#   AFL_CONFIG=configs/scafl_subset_queue_stress.yaml python -m afl.server
+#
+# 验证日志:
+#   python tools/check_scafl_stress_smoke.py --log-root <log_root 下含时间戳子目录的父路径>
+
+seed: 2025
+
+dataset: MNIST
+data_dir: /home/kamila/SCAFL/data/raw
+model: mlp
+
+num_clients: 5
+updates_per_client: 12
+
+non_iid: true
+num_shards: 20
+
+batch_size: 128
+local_epochs: 1
+local_lr: 0.005
+
+momentum: 0.9
+weight_decay: 0.0001
+grad_clip: 5.0
+
+server_lr: 0.3
+
+async_mode: buffered
+buffer_size: 4
+
+staleness_weight: exp
+staleness_lambda: 0.2
+
+staleness_cutoff: 2
+
+dynamic_control:
+  enabled: false
+
+policy:
+  type: scafl_p2
+  V: 10.0
+  min_select_size: 1
+  # 需 >1 才会在同一 logical_round 的 p2_prefix_diagnostics 中枚举多个 prefix_size；
+  # 仍可对满 buffer 的候选做真子集聚合（最优 prefix 长度常为 1）。
+  max_select_size: 3
+  force_select_ready: false
+
+heterogeneity:
+  enabled: true
+  profile: high
+  seed: 2025
+  compute_delay_enabled: true
+  upload_delay_enabled: true
+
+logging:
+  save_decision_debug: true
+  save_queue_trace: true
+  save_round_metrics: true
+  save_p2_prefix_diagnostics: true
+
+eval_every: 5
+log_root: /home/kamila/SCAFL/logs/afl_async_base
+device: cuda

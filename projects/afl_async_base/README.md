@@ -1,6 +1,8 @@
 # AFL Async Base (`projects/afl_async_base`)
 
-异步联邦学习实验代码（MNIST + MLP 等），含缓冲聚合、动态/固定陈旧阈值、SC-AFL-like 策略与队列诊断日志。
+异步联邦学习实验代码，含缓冲聚合、动态/固定陈旧阈值、SC-AFL-like 策略与队列诊断日志。数据集支持 **MNIST / FashionMNIST / CIFAR10 / CIFAR100 / SVHN / EMNIST（多划分）**（`afl/data.py`：`infer_num_classes` 自动设置分类头）。灰度（MNIST、Fashion、EMNIST）用 `model: mlp`；RGB（CIFAR、SVHN）用 `model: cnn_small`。冒烟示例：`configs/cifar100_cnn_smoke.yaml`、`configs/emnist_balanced_mlp_smoke.yaml`。
+
+**对比实验与 baseline 说明（可写入论文「实验设置 / 对照组」）**：见 [`docs/baseline_comparison_experiments.md`](docs/baseline_comparison_experiments.md)。
 
 ## SC-AFL-like Baseline
 

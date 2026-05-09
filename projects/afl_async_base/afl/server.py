@@ -11,7 +11,7 @@ import torch.multiprocessing as mp
 from typing import Any, Dict, List, Optional, Set, TextIO, Tuple
 
 from .model import build_model
-from .data import make_client_loaders
+from .data import infer_num_classes, make_client_loaders
 from .aggregator import Aggregator, StepResult, UpdateMsg
 from .runtime_state import ClientRuntimeState, BufferedUpdate, SystemState
 from .dynamic_controller import DynamicController
@@ -51,6 +51,15 @@ def _delta_l2_norm(delta: Dict[str, torch.Tensor]) -> float:
     """Overall L2 norm of delta dict (observation only)."""
     total = 0.0
     for v in delta.values():
+        total += float(v.detach().float().norm().item() ** 2)
+    return total ** 0.5
+
+
+@torch.no_grad()
+def _state_l2_norm(state: Dict[str, torch.Tensor]) -> float:
+    """L2 norm of full state_dict (observation / Manager writeback sanity check)."""
+    total = 0.0
+    for v in state.values():
         total += float(v.detach().float().norm().item() ** 2)
     return total ** 0.5
 
@@ -426,7 +435,8 @@ def client_proc(client_id: int, shared, lock, recv_q, cfg):
         simulate_upload_delay,
     )
 
-    model_builder = lambda: build_model(cfg["model"])
+    _nc = infer_num_classes(cfg["dataset"])
+    model_builder = lambda: build_model(cfg["model"], num_classes=_nc)
     loader = shared["client_loaders"][client_id]
     device = cfg["device"]
     het_on = hetero_enabled(cfg)
@@ -436,11 +446,13 @@ def client_proc(client_id: int, shared, lock, recv_q, cfg):
             base_step = int(shared["global_step"])
             base_state = copy.deepcopy(shared["global_state"])
 
+        compute_started_at = now_s()
+
         compute_extra = simulate_compute_delay(client_id, update_idx, cfg) if het_on else 0.0
         if compute_extra > 0:
             time.sleep(compute_extra)
 
-        delta, num_samples, local_epochs, train_started_at, train_finished_at, _sent_old, train_loss = train_one_client(
+        delta, num_samples, local_epochs, _train_started_at, train_finished_at, _sent_old, train_loss = train_one_client(
             client_id=client_id,
             base_state=base_state,
             loader=loader,
@@ -454,6 +466,9 @@ def client_proc(client_id: int, shared, lock, recv_q, cfg):
             simulate_hetero=not het_on,
         )
 
+        effective_train_started_at = compute_started_at
+        effective_train_finished_at = train_finished_at
+
         upload_delay_sim = simulate_upload_delay(client_id, update_idx, cfg) if het_on else 0.0
         upload_sent_at = now_s()
         if upload_delay_sim > 0:
@@ -465,8 +480,8 @@ def client_proc(client_id: int, shared, lock, recv_q, cfg):
             delta=delta,
             num_samples=num_samples,
             local_epochs=local_epochs,
-            train_started_at=train_started_at,
-            train_finished_at=train_finished_at,
+            train_started_at=effective_train_started_at,
+            train_finished_at=effective_train_finished_at,
             sent_at=upload_sent_at,
             train_loss=train_loss,
         )
@@ -842,7 +857,8 @@ def main():
         )
 
         device = cfg["device"]
-        model = build_model(cfg["model"]).to(device)
+        num_classes = infer_num_classes(cfg["dataset"])
+        model = build_model(cfg["model"], num_classes=num_classes).to(device)
         global_state = {k: v.detach().clone().cpu() for k, v in model.state_dict().items()}
 
         agg = Aggregator(
@@ -981,7 +997,7 @@ def main():
 
             compute_time_sum += compute_time
             upload_delay_sum += upload_delay
-
+            #后续加上这些参数的注释
             cs = client_states[msg.client_id]
             cs.last_base_step = int(msg.base_step)
             cs.last_recv_step = int(gs_before)
@@ -1127,8 +1143,11 @@ def main():
                     triggered_flush = False
                     global_step_after = int(shared["global_step"])
                 else:
+                    global_state_obj = shared["global_state"]
+                    state_norm_before = _state_l2_norm(global_state_obj)
+
                     step_result = agg.step(
-                        shared["global_state"],
+                        global_state_obj,
                         msg,
                         staleness,
                         buffer_target_override=buffer_target_override,
@@ -1144,10 +1163,19 @@ def main():
                     max_staleness_agg_after = max((s for _, s in agg.buffer), default=0)
 
                     if applied:
+                        shared["global_state"] = global_state_obj
                         shared["global_step"] = gs_before + 1
                         applied_updates += 1
 
                     global_step_after = int(shared["global_step"])
+                    state_norm_after = _state_l2_norm(global_state_obj)
+                    if applied and global_step_after <= 5:
+                        print(
+                            f"[STATE_CHECK] applied=1 "
+                            f"norm_before={state_norm_before:.6f} "
+                            f"norm_after={state_norm_after:.6f} "
+                            f"delta={abs(state_norm_after - state_norm_before):.6f}"
+                        )
 
             if accepted:
                 accepted_count += 1

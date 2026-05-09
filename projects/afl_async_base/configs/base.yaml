@@ -6,6 +6,8 @@ num_clients: 5
 updates_per_client: 80
 
 # ===== Dataset =====
+# 支持：MNIST | FashionMNIST | CIFAR10 | CIFAR100 | SVHN |
+#       EMNIST(=balanced,47类) | EMNIST_BYCLASS | EMNIST_DIGITS | EMNIST_LETTERS | EMNIST_MNIST | EMNIST_BYMERGE
 dataset: MNIST
 data_dir: /mnt/e/SCAFL/data/raw
 
@@ -14,6 +16,8 @@ non_iid: true
 num_shards: 20        # each client gets multiple shards (less extreme non-IID)
 
 # ===== Model & training =====
+# 灰度 28×28（MNIST/FashionMNIST）：mlp
+# RGB 32×32（CIFAR10/SVHN）：cnn_small
 model: mlp
 batch_size: 128
 local_epochs: 1

@@ -249,7 +249,7 @@ server.py
 ============================================================
 
 一句话职责
-- 加载 MNIST，并生成 IID/Non-IID 客户端 DataLoader。
+- 按 `dataset` 加载 MNIST / FashionMNIST / CIFAR10 / CIFAR100 / SVHN / EMNIST 等，并生成 IID/Non-IID 客户端 DataLoader；`infer_num_classes` 与 `build_model(..., num_classes=)` 对齐。
 
 核心被谁调用
 - server.py: make_client_loaders(...)
