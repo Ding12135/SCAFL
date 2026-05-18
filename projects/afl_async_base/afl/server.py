@@ -57,6 +57,15 @@ def _delta_l2_norm(delta: Dict[str, torch.Tensor]) -> float:
 
 
 @torch.no_grad()
+def _delta_payload_mb(delta: Dict[str, torch.Tensor]) -> float:
+    """Model update payload size in MiB, matching what the client uploads."""
+    total_bytes = 0
+    for v in delta.values():
+        total_bytes += int(v.numel()) * int(v.element_size())
+    return float(total_bytes) / (1024.0 * 1024.0)
+
+
+@torch.no_grad()
 def _state_l2_norm(state: Dict[str, torch.Tensor]) -> float:
     """L2 norm of full state_dict (observation / Manager writeback sanity check)."""
     total = 0.0
@@ -387,6 +396,36 @@ def collect_system_state(
         if valid_states
         else 0.0
     )
+    min_battery_soc_est = (
+        min(float(cs.battery_soc_est) for cs in valid_states) if valid_states else 1.0
+    )
+    min_net_bw_ul_mbps_est = (
+        min(float(cs.net_bw_ul_mbps_est) for cs in valid_states) if valid_states else 0.0
+    )
+    max_temp_c_est = (
+        max(float(cs.temp_c_est) for cs in valid_states) if valid_states else 0.0
+    )
+    cpu_util_heterogeneity_est = (
+        (
+            sum((float(cs.cpu_util_est) - avg_cpu_util_est) ** 2 for cs in valid_states)
+            / len(valid_states)
+        )
+        ** 0.5
+        if valid_states
+        else 0.0
+    )
+    net_bw_ul_heterogeneity_est = (
+        (
+            sum(
+                (float(cs.net_bw_ul_mbps_est) - avg_net_bw_ul_mbps_est) ** 2
+                for cs in valid_states
+            )
+            / len(valid_states)
+        )
+        ** 0.5
+        if valid_states
+        else 0.0
+    )
 
     return SystemState(
         avg_upload_delay=avg_upload_delay,
@@ -403,6 +442,11 @@ def collect_system_state(
         avg_net_loss_est=avg_net_loss_est,
         avg_temp_c_est=avg_temp_c_est,
         avg_mem_util_est=avg_mem_util_est,
+        min_battery_soc_est=min_battery_soc_est,
+        min_net_bw_ul_mbps_est=min_net_bw_ul_mbps_est,
+        max_temp_c_est=max_temp_c_est,
+        cpu_util_heterogeneity_est=cpu_util_heterogeneity_est,
+        net_bw_ul_heterogeneity_est=net_bw_ul_heterogeneity_est,
     )
 
 
@@ -488,6 +532,36 @@ def collect_system_state_from_candidate_set(
         if valid_states
         else 0.0
     )
+    min_battery_soc_est = (
+        min(float(cs.battery_soc_est) for cs in valid_states) if valid_states else 1.0
+    )
+    min_net_bw_ul_mbps_est = (
+        min(float(cs.net_bw_ul_mbps_est) for cs in valid_states) if valid_states else 0.0
+    )
+    max_temp_c_est = (
+        max(float(cs.temp_c_est) for cs in valid_states) if valid_states else 0.0
+    )
+    cpu_util_heterogeneity_est = (
+        (
+            sum((float(cs.cpu_util_est) - avg_cpu_util_est) ** 2 for cs in valid_states)
+            / len(valid_states)
+        )
+        ** 0.5
+        if valid_states
+        else 0.0
+    )
+    net_bw_ul_heterogeneity_est = (
+        (
+            sum(
+                (float(cs.net_bw_ul_mbps_est) - avg_net_bw_ul_mbps_est) ** 2
+                for cs in valid_states
+            )
+            / len(valid_states)
+        )
+        ** 0.5
+        if valid_states
+        else 0.0
+    )
 
     return SystemState(
         avg_upload_delay=avg_upload_delay,
@@ -504,6 +578,11 @@ def collect_system_state_from_candidate_set(
         avg_net_loss_est=avg_net_loss_est,
         avg_temp_c_est=avg_temp_c_est,
         avg_mem_util_est=avg_mem_util_est,
+        min_battery_soc_est=min_battery_soc_est,
+        min_net_bw_ul_mbps_est=min_net_bw_ul_mbps_est,
+        max_temp_c_est=max_temp_c_est,
+        cpu_util_heterogeneity_est=cpu_util_heterogeneity_est,
+        net_bw_ul_heterogeneity_est=net_bw_ul_heterogeneity_est,
     )
 
 
@@ -638,6 +717,11 @@ METRICS_HEADER = [
     "sys_avg_net_loss_est",
     "sys_avg_temp_c_est",
     "sys_avg_mem_util_est",
+    "sys_min_battery_soc_est",
+    "sys_min_net_bw_ul_mbps_est",
+    "sys_max_temp_c_est",
+    "sys_cpu_util_heterogeneity_est",
+    "sys_net_bw_ul_heterogeneity_est",
     "dropped_stale_count",
 ]
 
@@ -1114,6 +1198,7 @@ def main():
                     f"[WARNING] num_samples < 0, clamp: client={msg.client_id} raw={num_samples_raw}"
                 )
             num_samples = max(0, num_samples_raw)
+            delta_payload_mb = _delta_payload_mb(msg.delta)
 
             compute_time_sum += compute_time
             upload_delay_sum += upload_delay
@@ -1129,8 +1214,9 @@ def main():
                 EdgeObservation(
                     compute_time_s=compute_time,
                     upload_delay_s=upload_delay,
-                    staleness=int(staleness),
                     num_samples=num_samples,
+                    local_epochs=int(getattr(msg, "local_epochs", cfg.get("local_epochs", 1))),
+                    update_payload_mb=delta_payload_mb,
                 ),
             )
             #先预览候选集，后决策
@@ -1697,6 +1783,11 @@ def main():
                         float(system_state.avg_net_loss_est),
                         float(system_state.avg_temp_c_est),
                         float(system_state.avg_mem_util_est),
+                        float(system_state.min_battery_soc_est),
+                        float(system_state.min_net_bw_ul_mbps_est),
+                        float(system_state.max_temp_c_est),
+                        float(system_state.cpu_util_heterogeneity_est),
+                        float(system_state.net_bw_ul_heterogeneity_est),
                         int(step_result.dropped_stale_count),
                     ]
                 )

@@ -98,4 +98,9 @@ class SystemState:
     avg_net_loss_est: float = 0.0
     avg_temp_c_est: float = 0.0
     avg_mem_util_est: float = 0.0
+    min_battery_soc_est: float = 1.0
+    min_net_bw_ul_mbps_est: float = 0.0
+    max_temp_c_est: float = 0.0
+    cpu_util_heterogeneity_est: float = 0.0
+    net_bw_ul_heterogeneity_est: float = 0.0
 
