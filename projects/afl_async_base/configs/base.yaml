@@ -74,6 +74,52 @@ dynamic_control:
   buffer_coeff_heter: 0.5
   buffer_coeff_staleness: 0.5
 
+# ===== Edge device status modeling (server-side proxy, paper-aligned) =====
+# 说明：当前不接端侧真实状态时，服务端根据 compute/upload/staleness 递推估计：
+# cpu_util, battery_soc, bandwidth, rtt, loss, temperature, memory。
+edge_state_model:
+  enabled: true
+  dt_s: 1.0
+  ewma_alpha: 0.85
+  # CPU proxy
+  compute_time_ref_s: 1.0
+  cpu_floor: 0.02
+  # Network proxy
+  uplink_mb_per_sample: 0.003
+  downlink_ratio: 0.12
+  min_delay_s: 0.001
+  bw_ul_min_mbps: 0.2
+  bw_ul_max_mbps: 300.0
+  bw_dl_min_mbps: 0.2
+  bw_dl_max_mbps: 600.0
+  rtt_floor_ms: 8.0
+  rtt_upload_coeff_ms: 120.0
+  rtt_staleness_coeff_ms: 1.0
+  # Loss (logistic)
+  loss_bias: -3.0
+  loss_rtt_coeff: 1.1
+  loss_staleness_coeff: 0.9
+  loss_staleness_ref: 8.0
+  loss_cap: 0.6
+  # Energy/Battery
+  cpu_freq_ghz: 1.8
+  kappa_cpu: 0.18
+  tx_power_w: 1.3
+  rx_power_w: 1.0
+  base_power_w: 0.6
+  battery_mah: 4500.0
+  battery_v: 3.85
+  # Thermal
+  ambient_temp_c: 28.0
+  thermal_tau_s: 120.0
+  thermal_eta: 0.04
+  max_temp_c: 52.0
+  # Memory proxy
+  mem_base: 0.25
+  mem_cpu_coeff: 0.55
+  mem_staleness_coeff: 0.20
+  mem_staleness_ref: 8.0
+
 # ===== Evaluation & logging =====
 eval_every: 5
 log_root: /home/kamila/SCAFL/logs/afl_async_base

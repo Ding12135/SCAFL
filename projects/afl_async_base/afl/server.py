@@ -15,6 +15,7 @@ from .data import infer_num_classes, make_client_loaders
 from .aggregator import Aggregator, StepResult, UpdateMsg
 from .runtime_state import ClientRuntimeState, BufferedUpdate, SystemState
 from .dynamic_controller import DynamicController
+from .edge_state_model import EdgeObservation, EdgeStateModel
 from .scafl_policy import (
     compute_scafl_p2_objective_for_prefix,
     compute_queue_aware_priority_scores,
@@ -345,6 +346,48 @@ def collect_system_state(
     else:
         compute_heterogeneity = 0.0
 
+    valid_states = [cs for cs in client_states.values() if cs.last_recv_step >= 0]
+    avg_cpu_util_est = (
+        sum(float(cs.cpu_util_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+    avg_battery_soc_est = (
+        sum(float(cs.battery_soc_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 1.0
+    )
+    avg_net_bw_ul_mbps_est = (
+        sum(float(cs.net_bw_ul_mbps_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+    avg_net_bw_dl_mbps_est = (
+        sum(float(cs.net_bw_dl_mbps_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+    avg_net_rtt_ms_est = (
+        sum(float(cs.net_rtt_ms_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+    avg_net_loss_est = (
+        sum(float(cs.net_loss_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+    avg_temp_c_est = (
+        sum(float(cs.temp_c_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+    avg_mem_util_est = (
+        sum(float(cs.mem_util_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+
     return SystemState(
         avg_upload_delay=avg_upload_delay,
         avg_compute_time=avg_compute_time,
@@ -352,6 +395,14 @@ def collect_system_state(
         buffer_size=buffer_size,
         avg_buffer_staleness=avg_buffer_staleness,
         max_buffer_staleness=max_buffer_staleness,
+        avg_cpu_util_est=avg_cpu_util_est,
+        avg_battery_soc_est=avg_battery_soc_est,
+        avg_net_bw_ul_mbps_est=avg_net_bw_ul_mbps_est,
+        avg_net_bw_dl_mbps_est=avg_net_bw_dl_mbps_est,
+        avg_net_rtt_ms_est=avg_net_rtt_ms_est,
+        avg_net_loss_est=avg_net_loss_est,
+        avg_temp_c_est=avg_temp_c_est,
+        avg_mem_util_est=avg_mem_util_est,
     )
 
 
@@ -396,6 +447,48 @@ def collect_system_state_from_candidate_set(
     else:
         compute_heterogeneity = 0.0
 
+    valid_states = [cs for cs in client_states.values() if cs.last_recv_step >= 0]
+    avg_cpu_util_est = (
+        sum(float(cs.cpu_util_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+    avg_battery_soc_est = (
+        sum(float(cs.battery_soc_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 1.0
+    )
+    avg_net_bw_ul_mbps_est = (
+        sum(float(cs.net_bw_ul_mbps_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+    avg_net_bw_dl_mbps_est = (
+        sum(float(cs.net_bw_dl_mbps_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+    avg_net_rtt_ms_est = (
+        sum(float(cs.net_rtt_ms_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+    avg_net_loss_est = (
+        sum(float(cs.net_loss_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+    avg_temp_c_est = (
+        sum(float(cs.temp_c_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+    avg_mem_util_est = (
+        sum(float(cs.mem_util_est) for cs in valid_states) / len(valid_states)
+        if valid_states
+        else 0.0
+    )
+
     return SystemState(
         avg_upload_delay=avg_upload_delay,
         avg_compute_time=avg_compute_time,
@@ -403,6 +496,14 @@ def collect_system_state_from_candidate_set(
         buffer_size=buffer_size,
         avg_buffer_staleness=avg_buffer_staleness,
         max_buffer_staleness=max_buffer_staleness,
+        avg_cpu_util_est=avg_cpu_util_est,
+        avg_battery_soc_est=avg_battery_soc_est,
+        avg_net_bw_ul_mbps_est=avg_net_bw_ul_mbps_est,
+        avg_net_bw_dl_mbps_est=avg_net_bw_dl_mbps_est,
+        avg_net_rtt_ms_est=avg_net_rtt_ms_est,
+        avg_net_loss_est=avg_net_loss_est,
+        avg_temp_c_est=avg_temp_c_est,
+        avg_mem_util_est=avg_mem_util_est,
     )
 
 
@@ -529,6 +630,14 @@ METRICS_HEADER = [
     "avg_sys_compute_time",
     "avg_sys_upload_delay",
     "sys_compute_heterogeneity",
+    "sys_avg_cpu_util_est",
+    "sys_avg_battery_soc_est",
+    "sys_avg_net_bw_ul_mbps_est",
+    "sys_avg_net_bw_dl_mbps_est",
+    "sys_avg_net_rtt_ms_est",
+    "sys_avg_net_loss_est",
+    "sys_avg_temp_c_est",
+    "sys_avg_mem_util_est",
     "dropped_stale_count",
 ]
 
@@ -843,6 +952,7 @@ def main():
         print(f"[SERVER] policy.type={policy_cfg['type']}")
 
         controller = DynamicController(cfg)
+        edge_state_model = EdgeStateModel(cfg)
 
         with open(run_dir / "config.yaml", "w", encoding="utf-8") as f:
             yaml.safe_dump(cfg, f, allow_unicode=True)
@@ -879,6 +989,16 @@ def main():
                 estimated_compute_time=0.0,
                 estimated_upload_delay=0.0,
                 virtual_queue=0.0,
+                cpu_util_est=0.0,
+                battery_soc_est=1.0,
+                net_bw_ul_mbps_est=0.0,
+                net_bw_dl_mbps_est=0.0,
+                net_rtt_ms_est=0.0,
+                net_loss_est=0.0,
+                temp_c_est=float(
+                    cfg.get("edge_state_model", {}).get("ambient_temp_c", 28.0)
+                ),
+                mem_util_est=0.0,
             )
             for cid in range(cfg["num_clients"])
         }
@@ -950,7 +1070,7 @@ def main():
         # - message arrival 本身不计入 round；
         # - 仅当 buffered 且 applied=1 时 logical_round += 1。
         completed_flush_rounds = 0
-
+        #主流程开始
         while recv_step < total_msgs_target:
             try:
                 msg: UpdateMsg = recv_q.get(timeout=5.0)
@@ -1004,7 +1124,16 @@ def main():
             cs.current_staleness = int(staleness)
             cs.estimated_compute_time = compute_time
             cs.estimated_upload_delay = upload_delay
-
+            edge_state_model.update_client_state(
+                cs,
+                EdgeObservation(
+                    compute_time_s=compute_time,
+                    upload_delay_s=upload_delay,
+                    staleness=int(staleness),
+                    num_samples=num_samples,
+                ),
+            )
+            #先预览候选集，后决策
             if cfg["async_mode"] == "buffered":
                 msg.update_id = (
                     f"u{int(recv_step)}_c{int(msg.client_id)}_b{int(msg.base_step)}_r{int(completed_flush_rounds)}"
@@ -1037,7 +1166,7 @@ def main():
                 f"global_step={global_step_before_apply} staleness={int(staleness)} "
                 f"train_loss={msg.train_loss} compute_time={compute_time:.6f} upload_delay={upload_delay:.6f}"
             )
-
+            #计算动态控制器
             ctrl = controller.compute(system_state)
 
             buffer_target_override: Optional[int] = None
@@ -1560,6 +1689,14 @@ def main():
                         float(system_state.avg_compute_time),
                         float(system_state.avg_upload_delay),
                         float(system_state.compute_heterogeneity),
+                        float(system_state.avg_cpu_util_est),
+                        float(system_state.avg_battery_soc_est),
+                        float(system_state.avg_net_bw_ul_mbps_est),
+                        float(system_state.avg_net_bw_dl_mbps_est),
+                        float(system_state.avg_net_rtt_ms_est),
+                        float(system_state.avg_net_loss_est),
+                        float(system_state.avg_temp_c_est),
+                        float(system_state.avg_mem_util_est),
                         int(step_result.dropped_stale_count),
                     ]
                 )

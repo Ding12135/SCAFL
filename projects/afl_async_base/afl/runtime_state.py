@@ -39,6 +39,18 @@ class ClientRuntimeState:
     # - 非 candidate 客户端：本轮不变（工程边界约定）。
     virtual_queue: float
 
+    # ===== 端侧状态建模（服务器估计，不依赖端侧真实上报）=====
+    # 说明：这些字段由服务端根据 compute_time / upload_delay / staleness 等观测
+    # 通过状态转移模型递推得到，用于后续动态控制与日志分析。
+    cpu_util_est: float = 0.0               # [0, 1]
+    battery_soc_est: float = 1.0            # [0, 1]
+    net_bw_ul_mbps_est: float = 0.0         # Mbps
+    net_bw_dl_mbps_est: float = 0.0         # Mbps
+    net_rtt_ms_est: float = 0.0             # ms
+    net_loss_est: float = 0.0               # [0, 1]
+    temp_c_est: float = 0.0                 # degree C
+    mem_util_est: float = 0.0               # [0, 1]
+
 
 @dataclass
 class BufferedUpdate:
@@ -76,4 +88,14 @@ class SystemState:
     buffer_size: int
     avg_buffer_staleness: float
     max_buffer_staleness: int
+
+    # 聚合后的端侧估计状态（跨客户端均值）
+    avg_cpu_util_est: float = 0.0
+    avg_battery_soc_est: float = 1.0
+    avg_net_bw_ul_mbps_est: float = 0.0
+    avg_net_bw_dl_mbps_est: float = 0.0
+    avg_net_rtt_ms_est: float = 0.0
+    avg_net_loss_est: float = 0.0
+    avg_temp_c_est: float = 0.0
+    avg_mem_util_est: float = 0.0
 
